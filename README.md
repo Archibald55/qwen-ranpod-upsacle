@@ -57,8 +57,29 @@ GitHub repo**; RunPod builds the Dockerfile for you.
 | `QUANT` | gguf | `gguf` = Q4_K_M transformer (24 GB GPU). `bnb4` = NF4. `off` = bf16, needs 80 GB |
 | `GGUF_FILE` | Q4_K_M | Q5_K_M (15.4 GB) or Q6_K (17.9 GB) on a 32-48 GB GPU. Only Q4_K_M is baked in — others download on cold start |
 | `TEXT_ENCODER_4BIT` | 1 | NF4 Qwen2.5-VL: 16 GB → ~5.5 GB. Required on 24 GB |
+| `REQUIRE_LOCAL` | 0 | 1 = refuse to start instead of downloading the text encoder at runtime |
+| `LOCAL_BASE` | /models/base | components baked into the image (used before RunPod's cache) |
 | `CPU_OFFLOAD` | 0 | Last resort if the GPU still OOMs (slow; needs ~64 GB RAM) |
 | `UPSCALE_TILE` | 512 | upscaler tile size; lower if you ever hit OOM there |
+
+### Stopping the per-worker download
+
+`Fetching 4 files` in the worker log is the text encoder (~16 GB) coming from Hugging
+Face, billed as runtime, on every cold worker. The 40 GB transformer is not downloaded
+(the GGUF replaces it, and diffusers skips folders for components passed in directly).
+Three ways to avoid it, best first:
+
+1. **Cache it on the endpoint** (free, no rebuild): Manage -> Edit Endpoint -> Model =
+   `Qwen/Qwen-Image-Edit-2511`. Mounts at `/runpod-volume/huggingface-cache/hub/` and the
+   handler loads from there. Confirm it worked: the log should say `using cached model at ...`.
+2. **Bake it into the image**: `docker build --build-arg BAKE_BASE=1 ...`. Adds ~17 GB to
+   the image (text encoder, VAE, tokenizer; not the transformer) and a cold worker then
+   downloads nothing at all. Use this if the cached-model field keeps missing.
+3. **Network volume**: attach one and point `HF_HOME` at it, so the download happens once
+   and persists across workers.
+
+Set `REQUIRE_LOCAL=1` once one of those is in place: the worker then fails loudly on a
+cache miss instead of quietly re-downloading 16 GB per worker.
 
 ## 3. Request format
 

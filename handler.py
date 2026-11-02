@@ -53,6 +53,11 @@ GGUF_FILE = os.getenv("GGUF_FILE", "qwen-image-edit-2511-Q4_K_M.gguf")
 # transformer/config.json baked next to the GGUF, so loading needs no network call.
 # BASE_MODEL_BAKED records which model it came from: ignored if MODEL_ID differs.
 GGUF_CONFIG_DIR = os.getenv("GGUF_CONFIG_DIR", "/models/transformer")
+# Base components (text encoder, VAE, tokenizer) baked into the image, if they are.
+# Checked before RunPod's cache, which is checked before downloading from the Hub.
+LOCAL_BASE = os.getenv("LOCAL_BASE", "/models/base")
+# 1 = refuse to start rather than silently downloading ~16 GB on every cold worker.
+REQUIRE_LOCAL = os.getenv("REQUIRE_LOCAL", "0") == "1"
 BASE_MODEL_BAKED = os.getenv("BASE_MODEL_BAKED", "")
 # NF4-quantize the Qwen2.5-VL text encoder (16 GB bf16 -> ~5.5 GB). Required on 24 GB.
 TEXT_ENCODER_4BIT = os.getenv("TEXT_ENCODER_4BIT", "1" if QUANT != "off" else "0") == "1"
@@ -98,7 +103,10 @@ def mem() -> str:
 
 
 def resolve_model_path(model_id: str) -> str:
-    """Use RunPod's cached model if the endpoint has one, else fall back to downloading."""
+    """Prefer components baked into the image, then RunPod's cache, then the Hub."""
+    if os.path.isfile(os.path.join(LOCAL_BASE, "model_index.json")):
+        log.info(f"using baked-in components at {LOCAL_BASE}")
+        return LOCAL_BASE
     snaps = os.path.join(CACHE_ROOT, "models--" + model_id.replace("/", "--"), "snapshots")
     if os.path.isdir(snaps):
         for name in sorted(os.listdir(snaps)):
@@ -115,9 +123,13 @@ def resolve_model_path(model_id: str) -> str:
         have = sorted(n for n in os.listdir(root) if n.startswith("models--"))
         why = (f"{root} holds {have or 'nothing'}: the Model field names a different model "
                f"(it must read exactly {model_id})")
-    log.warning(f"{model_id} not cached - {why}. Components will download on demand "
-                f"(text encoder ~16 GB, or ~58 GB unquantized) on every cold worker. "
-                f"Fix: endpoint -> Manage -> Edit Endpoint -> Model = {model_id}")
+    fix = (f"Fix one of: (a) endpoint -> Manage -> Edit Endpoint -> Model = {model_id}; "
+           f"(b) build with --build-arg BAKE_BASE=1 to put them in the image; "
+           f"(c) attach a network volume and set HF_HOME onto it.")
+    if REQUIRE_LOCAL:
+        raise RuntimeError(f"REQUIRE_LOCAL=1 and {model_id} is not local - {why}. {fix}")
+    log.warning(f"{model_id} not cached - {why}. The text encoder (~16 GB) will download "
+                f"on this and every future cold worker, billed as runtime. {fix}")
     return model_id
 
 

@@ -42,6 +42,20 @@ shutil.copy(cfg, '/models/transformer/config.json')" \
     && rm -rf /root/.cache/huggingface
 ENV BASE_MODEL_BAKED=${BASE_MODEL}
 
+# Optional: bake the text encoder, VAE and configs into the image so a cold worker
+# downloads nothing. Adds ~17 GB to the image but removes a ~16 GB per-worker
+# download when the endpoint has no cached model. The 40 GB transformer is NOT
+# included: the GGUF above replaces it.
+ARG BAKE_BASE=0
+RUN if [ "$BAKE_BASE" = "1" ]; then \
+      python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('${BASE_MODEL}', local_dir='/models/base', \
+allow_patterns=['model_index.json','*.json','*.txt','text_encoder/*','vae/*',\
+'tokenizer/*','processor/*','scheduler/*'],\
+ignore_patterns=['transformer/*'])" \
+      && rm -rf /models/base/.cache; \
+    fi
+ENV LOCAL_BASE=/models/base
 # Lightning 4-step LoRA (works at 4 or 8 steps) + Real-ESRGAN x4plus upscaler
 RUN mkdir -p /models/lora /models/upscale \
     && python -c "from huggingface_hub import hf_hub_download; \
