@@ -1,0 +1,10 @@
+runpod>=1.7
+diffusers>=0.36.0
+transformers>=4.51
+accelerate>=1.2
+peft>=0.15
+safetensors
+huggingface_hub
+spandrel>=0.4
+pillow
+numpy
