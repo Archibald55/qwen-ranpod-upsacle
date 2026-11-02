@@ -1,0 +1,13 @@
+{
+  "input": {
+    "prompt": "Enhance this photo to professional studio product photography quality. Keep the object exactly as it is and replace only the background with a clean seamless studio backdrop.",
+    "image_url": "https://raw.githubusercontent.com/wlsdml1114/qwen_image_edit/main/examples/input/test_input.png",
+    "upscale": 2.0,
+    "upscale_model": "RealESRGAN_x4plus.pth",
+    "edit_mp": 1.0,
+    "steps": 4,
+    "true_cfg_scale": 1.0,
+    "seed": 42,
+    "output_format": "png"
+  }
+}

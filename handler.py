@@ -1,492 +1,416 @@
 """
-RunPod serverless worker: Qwen-Image-Edit-2511 (+ Lightning LoRA) with built-in
-Real-ESRGAN upscaling.
+RunPod serverless worker: Qwen-Image-Edit-2511 (+ Lightning 4-step LoRA) on ComfyUI,
+with optional Real-ESRGAN upscaling of the edited image.
 
-Same request/response shape as the FLUX.2-klein worker used by enhance_batch.py:
+Built on the wlsdml1114/qwen_image_edit worker: ComfyUI runs in the background
+(see entrypoint.sh) and this handler drives it over its HTTP/websocket API with one
+of the workflow graphs in ./workflow. The upscale pass is grafted onto the graph at
+request time (SaveImage is rewired behind UpscaleModelLoader -> ImageUpscaleWithModel
+-> ImageScaleBy), so the stock workflows stay usable unchanged in the ComfyUI editor.
+
+Request:
 
   {"input": {
-      "prompt": "...",                       # required
-      "image_base64": "<base64 or data URI>",  # required, the photo to edit (Picture 1)
-      "reference_image_base64": "<base64>",  # optional style reference (Picture 2)
-      "upscale": 2.0,                        # 1 = none, up to 4 (2 on a ~1 MP edit = ~4 MP)
-      "seed": 42,                            # optional, omit / -1 = random
-      "steps": 8,                            # optional, default DEFAULT_STEPS
-      "true_cfg_scale": 1.0,                 # optional, 1.0 with Lightning, ~4 without
-      "negative_prompt": " ",                # optional (only used when true_cfg_scale > 1)
-      "edit_mp": 1.0,                        # optional, megapixels Qwen edits at (default 1)
-      "output_format": "png"                 # png | jpeg | webp
+      "prompt": "...",                        # required: the edit instruction
+      "negative_prompt": "",                  # optional (only matters at cfg > 1)
+
+      # Picture 1 - the image being edited. One of:
+      "image_base64": "<base64 or data URI>",
+      "image_url":   "https://...",
+      "image_path":  "/abs/path.png",         # path inside the container
+
+      # Picture 2 / 3 - optional extra references, same three forms:
+      "image_base64_2" | "image_url_2" | "image_path_2",
+      "image_base64_3" | "image_url_3" | "image_path_3",
+      "reference_image_base64" / "reference_image_url"   # aliases for Picture 2
+
+      "upscale": 2.0,            # 1 = off, up to MAX_UPSCALE (2 on a 1 MP edit = ~4 MP)
+      "upscale_model": "RealESRGAN_x4plus.pth",   # any file in models/upscale_models
+      "edit_mp": 1.0,            # megapixels Qwen edits at (Qwen's native size is 1)
+      "steps": 4,                # Lightning LoRA is trained for 4
+      "true_cfg_scale": 1.0,     # 1.0 with Lightning
+      "seed": 42,                # omit or -1 for random
+      "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
+      "lora_strength": 1.0, "shift": 3.0,
+      "output_format": "png",    # png | jpeg | webp
+      "jpeg_quality": 95
   }}
 
-  -> {"image": "data:image/png;base64,...", "width": W, "height": H, "seed": S,
-      "timings": {...}}      or      {"error": "..."}
+Response:
+
+  {"image": "data:image/png;base64,...", "images": [...], "width": W, "height": H,
+   "seed": S, "upscale": 2.0,
+   "timings": {"total_s": .., "comfy_s": .., "gpu_s": .., "steps": ..}}
+
+  or {"error": "..."}
 """
 
 import base64
+import binascii
 import io
+import json
 import logging
-import math
 import os
 import random
+import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 
-import numpy as np
 import runpod
-import torch
-from PIL import Image, ImageOps
+import websocket
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("qwen-worker")
+logger = logging.getLogger("qwen-worker")
 
-MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-Edit-2511")
-CACHE_ROOT = os.getenv("HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
-USE_LIGHTNING = os.getenv("USE_LIGHTNING", "1") == "1"
-LORA_PATH = os.getenv("LORA_PATH", "/models/lora/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
-UPSCALER_PATH = os.getenv("UPSCALER_PATH", "/models/upscale/RealESRGAN_x4plus.pth")
-CPU_OFFLOAD = os.getenv("CPU_OFFLOAD", "0") == "1"  # last resort: slower, needs lots of RAM
+SERVER_ADDRESS = os.getenv("SERVER_ADDRESS", "127.0.0.1")
+SERVER_PORT = os.getenv("SERVER_PORT", "8188")
+BASE_URL = f"http://{SERVER_ADDRESS}:{SERVER_PORT}"
+CLIENT_ID = str(uuid.uuid4())
 
-# Quantization. "gguf" (default) runs on a 24 GB GPU: Q4_K_M transformer (12.8 GB) +
-# NF4 text encoder (~5.5 GB) + VAE, ~21 GB peak at edit_mp 1.0. "off" = bf16, needs 80 GB.
-QUANT = os.getenv("QUANT", "gguf").lower()
-GGUF_PATH = os.getenv("GGUF_PATH", "/models/transformer/qwen-image-edit-2511-Q4_K_M.gguf")
-GGUF_REPO = os.getenv("GGUF_REPO", "unsloth/Qwen-Image-Edit-2511-GGUF")
-GGUF_FILE = os.getenv("GGUF_FILE", "qwen-image-edit-2511-Q4_K_M.gguf")
-# transformer/config.json baked next to the GGUF, so loading needs no network call.
-# BASE_MODEL_BAKED records which model it came from: ignored if MODEL_ID differs.
-GGUF_CONFIG_DIR = os.getenv("GGUF_CONFIG_DIR", "/models/transformer")
-# Base components (text encoder, VAE, tokenizer) baked into the image, if they are.
-# Checked before RunPod's cache, which is checked before downloading from the Hub.
-LOCAL_BASE = os.getenv("LOCAL_BASE", "/models/base")
-# 1 = refuse to start rather than silently downloading ~16 GB on every cold worker.
-REQUIRE_LOCAL = os.getenv("REQUIRE_LOCAL", "0") == "1"
-# VAE decode at ~1 MP spikes several GB in one allocation; tiling caps it.
-VAE_TILING = os.getenv("VAE_TILING", "1") == "1"
-# Trades a little speed for a much smaller attention peak. On by default when quantized,
-# where the weights already eat most of a 24 GB card.
-ATTENTION_SLICING = os.getenv("ATTENTION_SLICING", "") or ""
-BASE_MODEL_BAKED = os.getenv("BASE_MODEL_BAKED", "")
-# NF4-quantize the Qwen2.5-VL text encoder (16 GB bf16 -> ~5.5 GB). Required on 24 GB.
-TEXT_ENCODER_4BIT = os.getenv("TEXT_ENCODER_4BIT", "1" if QUANT != "off" else "0") == "1"
-DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "8" if USE_LIGHTNING else "40"))
-DEFAULT_CFG = float(os.getenv("DEFAULT_CFG", "1.0" if USE_LIGHTNING else "4.0"))
-UPSCALE_TILE = int(os.getenv("UPSCALE_TILE", "512"))
-MAX_UPSCALE = 4.0
-DEVICE = "cuda"
-
-# Scheduler settings published with Qwen-Image-Lightning for few-step inference.
-LIGHTNING_SCHEDULER = {
-    "base_image_seq_len": 256,
-    "base_shift": math.log(3),
-    "invert_sigmas": False,
-    "max_image_seq_len": 8192,
-    "max_shift": math.log(3),
-    "num_train_timesteps": 1000,
-    "shift": 1.0,
-    "shift_terminal": None,
-    "stochastic_sampling": False,
-    "time_shift_type": "exponential",
-    "use_beta_sigmas": False,
-    "use_dynamic_shifting": True,
-    "use_exponential_sigmas": False,
-    "use_karras_sigmas": False,
+WORKFLOW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflow")
+WORKFLOW_FILES = {
+    1: "qwen_image_edit_1_1image.json",
+    2: "qwen_image_edit_1_2image.json",
+    3: "qwen_image_edit_1_3image.json",
 }
 
+# Node ids inside those graphs (identical across the three files).
+NODE_IMAGE = {1: "78", 2: "117", 3: "119"}
+NODE_SAMPLER = "3"          # KSampler: seed, steps, cfg, sampler_name, scheduler, denoise
+NODE_POSITIVE = "111"       # TextEncodeQwenImageEditPlus (prompt)
+NODE_NEGATIVE = "110"       # TextEncodeQwenImageEditPlus (negative prompt)
+# ImageScaleToTotalPixels, one per picture (93 = Picture 1, 118/120 = the references)
+NODE_EDIT_SCALE = ("93", "118", "120")
+NODE_SHIFT = "66"           # ModelSamplingAuraFlow -> shift
+NODE_LORA = "89"            # LoraLoaderModelOnly -> strength_model
+NODE_SAVE = "60"            # SaveImage
 
-# ───────────────────────── model loading (once per worker) ─────────────────────────
+# Ids used for the injected upscale chain; high enough not to collide.
+NODE_UPSCALE_LOADER = "900"
+NODE_UPSCALE_APPLY = "901"
+NODE_UPSCALE_RESIZE = "902"
 
-def mem() -> str:
-    """Host RAM available and GPU allocated, for spotting a load that is swapping."""
-    out = []
+DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "4"))
+DEFAULT_CFG = float(os.getenv("DEFAULT_CFG", "1.0"))
+DEFAULT_EDIT_MP = float(os.getenv("DEFAULT_EDIT_MP", "1.0"))
+DEFAULT_UPSCALE = float(os.getenv("DEFAULT_UPSCALE", "1.0"))
+UPSCALE_MODEL = os.getenv("UPSCALE_MODEL", "RealESRGAN_x4plus.pth")
+# Native scale of UPSCALE_MODEL. The requested factor is reached by running the model
+# once and then resampling by factor / UPSCALE_MODEL_SCALE.
+UPSCALE_MODEL_SCALE = float(os.getenv("UPSCALE_MODEL_SCALE", "4"))
+UPSCALE_RESAMPLE = os.getenv("UPSCALE_RESAMPLE", "lanczos")
+MAX_UPSCALE = float(os.getenv("MAX_UPSCALE", "4"))
+JOB_TIMEOUT = float(os.getenv("JOB_TIMEOUT", "900"))        # per-request ComfyUI budget
+BOOT_TIMEOUT = float(os.getenv("BOOT_TIMEOUT", "300"))      # wait for ComfyUI on cold start
+
+
+# ───────────────────────── input handling ─────────────────────────
+
+def download_file(url: str, output_path: str) -> str:
+    result = subprocess.run(["wget", "-O", output_path, "--no-verbose", url],
+                            capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"download failed for {url}: {result.stderr.strip()[:300]}")
+    logger.info(f"downloaded {url} -> {output_path}")
+    return output_path
+
+
+def save_base64(data: str, output_path: str) -> str:
     try:
-        with open("/proc/meminfo") as f:
-            info = {k: v for k, v in (l.split(":", 1) for l in f)}
-        out.append(f"ram_free {int(info['MemAvailable'].split()[0]) / 1e6:.1f} GB")
-    except Exception:
-        pass
-    if torch.cuda.is_available():
-        out.append(f"gpu {torch.cuda.memory_allocated() / 1e9:.1f} GB")
-    return ", ".join(out)
+        raw = base64.b64decode(data.split(",", 1)[-1], validate=False)
+    except (binascii.Error, ValueError) as e:
+        raise RuntimeError(f"invalid base64 image: {e}")
+    if not raw:
+        raise RuntimeError("empty base64 image")
+    with open(output_path, "wb") as f:
+        f.write(raw)
+    logger.info(f"wrote {len(raw) / 1e6:.1f} MB of base64 input -> {output_path}")
+    return output_path
 
 
-def resolve_model_path(model_id: str) -> str:
-    """Prefer components baked into the image, then RunPod's cache, then the Hub."""
-    if os.path.isfile(os.path.join(LOCAL_BASE, "model_index.json")):
-        log.info(f"using baked-in components at {LOCAL_BASE}")
-        return LOCAL_BASE
-    snaps = os.path.join(CACHE_ROOT, "models--" + model_id.replace("/", "--"), "snapshots")
-    if os.path.isdir(snaps):
-        for name in sorted(os.listdir(snaps)):
-            path = os.path.join(snaps, name)
-            if os.path.isfile(os.path.join(path, "model_index.json")):
-                log.info(f"using cached model at {path}")
-                return path
-    root = CACHE_ROOT
-    if not os.path.isdir("/runpod-volume"):
-        why = "/runpod-volume does not exist: no network volume and no cached model on this endpoint"
-    elif not os.path.isdir(root):
-        why = f"{root} does not exist: the endpoint has no cached model"
-    else:
-        have = sorted(n for n in os.listdir(root) if n.startswith("models--"))
-        why = (f"{root} holds {have or 'nothing'}: the Model field names a different model "
-               f"(it must read exactly {model_id})")
-    fix = (f"Fix one of: (a) endpoint -> Manage -> Edit Endpoint -> Model = {model_id}; "
-           f"(b) build with --build-arg BAKE_BASE=1 to put them in the image; "
-           f"(c) attach a network volume and set HF_HOME onto it.")
-    if REQUIRE_LOCAL:
-        raise RuntimeError(f"REQUIRE_LOCAL=1 and {model_id} is not local - {why}. {fix}")
-    log.warning(f"{model_id} not cached - {why}. The text encoder (~16 GB) will download "
-                f"on this and every future cold worker, billed as runtime. {fix}")
-    return model_id
+def resolve_image(job_input: dict, slot: int, temp_dir: str):
+    """Materialize the image for Picture `slot` as a file, or return None if absent.
 
-
-def component_source(base_path: str, name: str):
-    """(path_or_repo, subfolder) for one pipeline component, local snapshot or hub repo."""
-    local = os.path.join(base_path, name)
-    if os.path.isdir(local):
-        return local, None
-    return base_path, name
-
-
-def load_transformer_gguf(base_path: str):
-    """Q4/Q5/Q6 GGUF transformer. Dequantized to bf16 per-layer at compute time."""
-    from diffusers import GGUFQuantizationConfig, QwenImageTransformer2DModel
-
-    path = GGUF_PATH
-    if not os.path.isfile(path):
-        from huggingface_hub import hf_hub_download
-        log.warning(f"{GGUF_PATH} not baked in; downloading {GGUF_REPO}/{GGUF_FILE}")
-        path = hf_hub_download(GGUF_REPO, GGUF_FILE)
-    # Prefer the baked config: with no cached model, a repo id here means a Hub
-    # round-trip in the middle of the load.
-    if BASE_MODEL_BAKED == MODEL_ID and os.path.isfile(os.path.join(GGUF_CONFIG_DIR, "config.json")):
-        cfg_src, cfg_sub = GGUF_CONFIG_DIR, None
-    else:
-        cfg_src, cfg_sub = component_source(base_path, "transformer")
-        if cfg_src == base_path and not os.path.isdir(base_path):
-            log.warning(f"transformer config will be fetched from the Hub ({base_path}); "
-                        f"bake it or cache the model to avoid a network call during load")
-    kwargs = {"config": cfg_src, "torch_dtype": torch.bfloat16,
-              "quantization_config": GGUFQuantizationConfig(compute_dtype=torch.bfloat16)}
-    if cfg_sub:
-        kwargs["subfolder"] = cfg_sub
-    gb = os.path.getsize(path) / 1e9
-    log.info(f"loading GGUF transformer {os.path.basename(path)} ({gb:.1f} GB), "
-             f"config from {cfg_src}; {mem()}")
-    t = time.time()
-    tr = QwenImageTransformer2DModel.from_single_file(path, **kwargs)
-    log.info(f"transformer read in {time.time() - t:.0f}s; {mem()}")
-    return tr
-
-
-def load_transformer_bnb4(base_path: str):
-    """NF4 bitsandbytes transformer (~11 GB). Alternative to GGUF, no extra file needed."""
-    from diffusers import BitsAndBytesConfig, QwenImageTransformer2DModel
-
-    src, sub = component_source(base_path, "transformer")
-    return QwenImageTransformer2DModel.from_pretrained(
-        src, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": 0},
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True),
-    )
-
-
-def load_text_encoder_4bit(base_path: str):
-    from transformers import BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
-
-    src, sub = component_source(base_path, "text_encoder")
-    log.info(f"loading NF4 text encoder from {src}; {mem()}")
-    return Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        src, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": 0},
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True),
-    )
-
-
-def quant_method(mod) -> str:
-    """Name of the quantizer backing this module, or "" if it is not quantized."""
-    for owner in (getattr(mod, "config", None), getattr(mod, "hf_quantizer", None)):
-        qc = getattr(owner, "quantization_config", None)
-        if qc is not None:
-            m = getattr(qc, "quant_method", None) or getattr(qc, "quantization_method", None)
-            if m is not None:
-                return str(getattr(m, "value", m)).lower()
-    return ""
-
-
-def place(pipe, names=("transformer", "text_encoder", "vae")):
-    """Move components onto the GPU.
-
-    bitsandbytes modules are placed at load time (device_map) and raise on .to();
-    GGUF modules load on the CPU and must be moved, so a blanket "skip quantized"
-    check leaves the transformer on the CPU and every matmul then fails with
-    "Expected all tensors to be on the same device".
+    Accepts image_path / image_url / image_base64 (slot 1) and the _2 / _3 variants,
+    plus reference_image_* as an alias for slot 2.
     """
-    for name in names:
-        mod = getattr(pipe, name, None)
-        if mod is None or not hasattr(mod, "to"):
+    suffix = "" if slot == 1 else f"_{slot}"
+    keys = [(f"image_path{suffix}", "path"), (f"image_url{suffix}", "url"),
+            (f"image_base64{suffix}", "base64")]
+    if slot == 2:
+        keys += [("reference_image_path", "path"), ("reference_image_url", "url"),
+                 ("reference_image_base64", "base64")]
+    for key, kind in keys:
+        value = job_input.get(key)
+        if not value:
             continue
-        method = quant_method(mod)
-        if "bitsandbytes" in method:
-            pass  # already on its load-time device
-        else:
-            try:
-                mod.to(DEVICE)
-            except (ValueError, NotImplementedError) as e:
-                log.info(f"{name}: not movable ({e}); keeping its load-time device")
+        if kind == "path":
+            if not os.path.isfile(value):
+                raise RuntimeError(f"{key} does not exist in the container: {value}")
+            return value
+        os.makedirs(temp_dir, exist_ok=True)
+        dst = os.path.abspath(os.path.join(temp_dir, f"input_{slot}.png"))
+        return download_file(value, dst) if kind == "url" else save_base64(value, dst)
+    return None
+
+
+# ───────────────────────── ComfyUI API ─────────────────────────
+
+def wait_for_comfyui(timeout: float):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
         try:
-            prm = next(mod.parameters(), None)
-            log.info(f"{name}: device={prm.device if prm is not None else '?'} "
-                     f"quant={method or 'none'}")
+            urllib.request.urlopen(f"{BASE_URL}/", timeout=5).read(1)
+            return
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise RuntimeError(f"ComfyUI did not answer on {BASE_URL} within {timeout:.0f}s ({last})")
+
+
+def queue_prompt(prompt: dict) -> str:
+    data = json.dumps({"prompt": prompt, "client_id": CLIENT_ID}).encode("utf-8")
+    req = urllib.request.Request(f"{BASE_URL}/prompt", data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read())["prompt_id"]
+    except urllib.error.HTTPError as e:
+        # ComfyUI returns the per-node validation errors in the body; without them a
+        # rejected graph looks like a bare "HTTP Error 400: Bad Request".
+        raise RuntimeError(f"ComfyUI rejected the workflow: {e.read().decode('utf-8', 'replace')[:1000]}")
+
+
+def get_history(prompt_id: str) -> dict:
+    with urllib.request.urlopen(f"{BASE_URL}/history/{prompt_id}") as response:
+        return json.loads(response.read())
+
+
+def get_image(filename: str, subfolder: str, folder_type: str) -> bytes:
+    query = urllib.parse.urlencode({"filename": filename, "subfolder": subfolder,
+                                    "type": folder_type})
+    with urllib.request.urlopen(f"{BASE_URL}/view?{query}") as response:
+        return response.read()
+
+
+def run_workflow(prompt: dict, timeout: float):
+    """Queue the graph, wait for it to finish, return the output images as bytes."""
+    ws = websocket.WebSocket()
+    ws.settimeout(timeout)
+    ws.connect(f"ws://{SERVER_ADDRESS}:{SERVER_PORT}/ws?clientId={CLIENT_ID}")
+    try:
+        prompt_id = queue_prompt(prompt)
+        logger.info(f"queued prompt {prompt_id}")
+        deadline = time.time() + timeout
+        while True:
+            if time.time() > deadline:
+                raise RuntimeError(f"workflow did not finish within {timeout:.0f}s")
+            out = ws.recv()
+            if not isinstance(out, str):
+                continue  # binary preview frame
+            message = json.loads(out)
+            data = message.get("data") or {}
+            if data.get("prompt_id") not in (None, prompt_id):
+                continue
+            if message.get("type") == "execution_error":
+                raise RuntimeError(f"ComfyUI execution error in node "
+                                   f"{data.get('node_type')} ({data.get('node_id')}): "
+                                   f"{data.get('exception_message')}")
+            if message.get("type") == "execution_interrupted":
+                raise RuntimeError("ComfyUI execution was interrupted")
+            if message.get("type") == "executing" and data.get("node") is None \
+                    and data.get("prompt_id") == prompt_id:
+                break
+    finally:
+        try:
+            ws.close()
         except Exception:
             pass
 
-
-def load_pipeline():
-    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
-
-    t0 = time.time()
-    base = resolve_model_path(MODEL_ID)
-    kwargs = {"torch_dtype": torch.bfloat16}
-    if USE_LIGHTNING:
-        kwargs["scheduler"] = FlowMatchEulerDiscreteScheduler.from_config(LIGHTNING_SCHEDULER)
-    if QUANT == "gguf":
-        tr = load_transformer_gguf(base)
-        if not CPU_OFFLOAD:
-            # Move it now rather than in place() below: a GGUF transformer is built in
-            # host RAM, and holding 12.8 GB there while the text encoder reads and
-            # quantizes 16 GB of shards can exhaust a serverless worker's RAM and swap.
-            t = time.time()
-            tr.to(DEVICE)
-            log.info(f"transformer -> {DEVICE} in {time.time() - t:.0f}s; {mem()}")
-        kwargs["transformer"] = tr
-    elif QUANT == "bnb4":
-        kwargs["transformer"] = load_transformer_bnb4(base)
-    elif QUANT != "off":
-        raise ValueError(f"QUANT must be gguf, bnb4 or off (got {QUANT!r})")
-    if TEXT_ENCODER_4BIT:
-        kwargs["text_encoder"] = load_text_encoder_4bit(base)
-        log.info(f"text encoder ready; {mem()}")
-
-    pipe = QwenImageEditPlusPipeline.from_pretrained(base, **kwargs)
-    log.info(f"pipeline assembled; {mem()}")
-    if not CPU_OFFLOAD:
-        # pipe.to(DEVICE) rejects bitsandbytes modules, so place each one individually.
-        place(pipe)
-    if USE_LIGHTNING:
-        log.info(f"loading Lightning LoRA; {mem()}")
-        pipe.load_lora_weights(os.path.dirname(LORA_PATH), weight_name=os.path.basename(LORA_PATH),
-                               adapter_name="lightning")
-        if QUANT == "off":
-            pipe.fuse_lora(adapter_names=["lightning"], lora_scale=1.0)
-            pipe.unload_lora_weights()  # fused weights stay, LoRA layers are removed
-        else:
-            # fuse_lora cannot write into quantized weights: keep the adapter live instead
-            # (a few % slower per step, same result).
-            pipe.set_adapters(["lightning"], adapter_weights=[1.0])
-    if CPU_OFFLOAD:
-        pipe.enable_model_cpu_offload()
-    if VAE_TILING:
-        for fn in ("enable_tiling", "enable_slicing"):
-            try:
-                getattr(pipe.vae, fn)()
-            except Exception as e:
-                log.info(f"vae.{fn}() unavailable: {e}")
-        log.info("vae tiling + slicing on")
-    slicing = ATTENTION_SLICING or ("1" if QUANT != "off" else "0")
-    if slicing not in ("0", "off", "false"):
-        try:
-            pipe.enable_attention_slicing("auto" if slicing in ("1", "auto", "true") else int(slicing))
-            log.info(f"attention slicing on ({slicing})")
-        except Exception as e:
-            log.info(f"attention slicing unavailable: {e}")
-    pipe.set_progress_bar_config(disable=True)
-    global RESIDENT_GB
-    RESIDENT_GB = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-    free = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
-    log.info(f"pipeline ready in {time.time() - t0:.0f}s (quant={QUANT}, te4bit={TEXT_ENCODER_4BIT}, "
-             f"lightning={USE_LIGHTNING}, offload={CPU_OFFLOAD}); "
-             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB allocated, {free:.1f} GB free")
-    return pipe
+    history = get_history(prompt_id).get(prompt_id) or {}
+    status = history.get("status") or {}
+    images = []
+    for node_output in (history.get("outputs") or {}).values():
+        for image in node_output.get("images") or []:
+            if image.get("type") == "temp":
+                continue  # preview copies of the same frame
+            images.append(get_image(image["filename"], image.get("subfolder", ""),
+                                    image.get("type", "output")))
+    if not images:
+        raise RuntimeError(f"the workflow produced no images (status: {status})")
+    return images
 
 
-def load_upscaler():
-    from spandrel import ImageModelDescriptor, ModelLoader
+# ───────────────────────── graph preparation ─────────────────────────
 
-    model = ModelLoader().load_from_file(UPSCALER_PATH)
-    if not isinstance(model, ImageModelDescriptor):
-        raise RuntimeError(f"{UPSCALER_PATH} is not an image-to-image upscaler")
-    model = model.cuda().eval()
-    half = bool(model.supports_half)
-    if half:
-        model = model.half()
-    log.info(f"upscaler loaded: {model.architecture.name if hasattr(model, 'architecture') else ''} x{model.scale}")
-    return model, half
+def load_workflow(num_images: int) -> dict:
+    path = os.path.join(WORKFLOW_DIR, WORKFLOW_FILES[num_images])
+    if not os.path.isfile(path):
+        raise RuntimeError(f"workflow file missing: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-PIPE = None
-UPSCALER, UPSCALER_HALF = None, False
-RESIDENT_GB = 0.0     # GPU memory the loaded weights occupy, for the OOM message
+def add_upscale(prompt: dict, factor: float, model_name: str):
+    """Rewire SaveImage through an ESRGAN upscale of the decoded image.
 
-
-def init():
-    """Load the models. Called from __main__ before serving, or by a test harness.
-
-    Kept out of import time so handler.py can be imported and exercised without
-    loading 13 GB of weights.
+    The model runs at its native scale (x4 for RealESRGAN_x4plus); anything other
+    than that exact factor is resampled afterwards, so upscale=2 is a x4 pass
+    followed by a lanczos halving rather than a plain x2 resize.
     """
-    global PIPE, UPSCALER, UPSCALER_HALF
-    if PIPE is None:
-        PIPE = load_pipeline()
-    if UPSCALER is None:
-        UPSCALER, UPSCALER_HALF = load_upscaler()
+    source = prompt[NODE_SAVE]["inputs"]["images"]
+    prompt[NODE_UPSCALE_LOADER] = {
+        "inputs": {"model_name": model_name},
+        "class_type": "UpscaleModelLoader",
+        "_meta": {"title": "Load Upscale Model"},
+    }
+    prompt[NODE_UPSCALE_APPLY] = {
+        "inputs": {"upscale_model": [NODE_UPSCALE_LOADER, 0], "image": source},
+        "class_type": "ImageUpscaleWithModel",
+        "_meta": {"title": "Upscale Image (using Model)"},
+    }
+    out = [NODE_UPSCALE_APPLY, 0]
+    scale_by = factor / UPSCALE_MODEL_SCALE
+    if abs(scale_by - 1.0) > 1e-3:
+        prompt[NODE_UPSCALE_RESIZE] = {
+            "inputs": {"upscale_method": UPSCALE_RESAMPLE,
+                       "scale_by": round(scale_by, 4), "image": out},
+            "class_type": "ImageScaleBy",
+            "_meta": {"title": "Upscale Image By"},
+        }
+        out = [NODE_UPSCALE_RESIZE, 0]
+    prompt[NODE_SAVE]["inputs"]["images"] = out
+    logger.info(f"upscale x{factor} via {model_name} "
+                f"(model x{UPSCALE_MODEL_SCALE:g}, then x{scale_by:.3f} {UPSCALE_RESAMPLE})")
 
 
-# ───────────────────────── helpers ─────────────────────────
+def build_prompt(job_input: dict, image_paths: list, seed: int) -> dict:
+    prompt = load_workflow(len(image_paths))
 
-def decode_image(data: str) -> Image.Image:
-    raw = base64.b64decode(data.split(",", 1)[-1])
-    im = Image.open(io.BytesIO(raw))
-    im = ImageOps.exif_transpose(im)
-    if im.mode in ("RGBA", "LA", "P"):
-        im = im.convert("RGBA")
-        bg = Image.new("RGB", im.size, (255, 255, 255))
-        bg.paste(im, mask=im.split()[-1])
-        return bg
-    return im.convert("RGB")
+    for slot, path in enumerate(image_paths, start=1):
+        prompt[NODE_IMAGE[slot]]["inputs"]["image"] = path
 
+    prompt[NODE_POSITIVE]["inputs"]["prompt"] = job_input["prompt"]
+    prompt[NODE_NEGATIVE]["inputs"]["prompt"] = job_input.get("negative_prompt") or ""
 
-def edit_size(w: int, h: int, mp: float, multiple: int = 32):
-    """Width/height with the same aspect ratio as the input and ~mp megapixels."""
-    target = mp * 1024 * 1024
-    ratio = w / h
-    nw = math.sqrt(target * ratio)
-    nh = nw / ratio
-    nw = max(multiple * 8, round(nw / multiple) * multiple)
-    nh = max(multiple * 8, round(nh / multiple) * multiple)
-    return int(nw), int(nh)
+    sampler = prompt[NODE_SAMPLER]["inputs"]
+    sampler["seed"] = seed
+    sampler["steps"] = int(job_input.get("steps") or DEFAULT_STEPS)
+    sampler["cfg"] = float(job_input.get("true_cfg_scale")
+                           or job_input.get("cfg") or DEFAULT_CFG)
+    if job_input.get("sampler_name"):
+        sampler["sampler_name"] = job_input["sampler_name"]
+    if job_input.get("scheduler"):
+        sampler["scheduler"] = job_input["scheduler"]
+    if job_input.get("denoise") is not None:
+        sampler["denoise"] = float(job_input["denoise"])
 
+    edit_mp = max(0.25, min(float(job_input.get("edit_mp") or DEFAULT_EDIT_MP), 4.0))
+    for node in NODE_EDIT_SCALE:        # every picture, not just the one being edited
+        if node in prompt:
+            prompt[node]["inputs"]["megapixels"] = edit_mp
+    if job_input.get("shift") is not None:
+        prompt[NODE_SHIFT]["inputs"]["shift"] = float(job_input["shift"])
+    if job_input.get("lora_strength") is not None:
+        prompt[NODE_LORA]["inputs"]["strength_model"] = float(job_input["lora_strength"])
 
-@torch.inference_mode()
-def esrgan_upscale(img: Image.Image) -> Image.Image:
-    """Run the x4 model in overlapping tiles (bounded VRAM), return the x4 image."""
-    s = UPSCALER.scale
-    dtype = torch.float16 if UPSCALER_HALF else torch.float32
-    x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0)
-    x = x.permute(2, 0, 1).unsqueeze(0)  # 1,3,H,W
-    _, _, H, W = x.shape
-    out = torch.zeros((1, 3, H * s, W * s), dtype=torch.float32)
-    tile, pad = UPSCALE_TILE, 16
-    for y0 in range(0, H, tile):
-        for x0 in range(0, W, tile):
-            y1, x1 = min(y0 + tile, H), min(x0 + tile, W)
-            ya, xa = max(y0 - pad, 0), max(x0 - pad, 0)
-            yb, xb = min(y1 + pad, H), min(x1 + pad, W)
-            t = x[:, :, ya:yb, xa:xb].to(DEVICE, dtype)
-            o = UPSCALER(t).float().clamp_(0, 1).cpu()
-            oy, ox = (y0 - ya) * s, (x0 - xa) * s
-            out[:, :, y0 * s:y1 * s, x0 * s:x1 * s] = o[:, :, oy:oy + (y1 - y0) * s, ox:ox + (x1 - x0) * s]
-    arr = (out[0].permute(1, 2, 0).numpy() * 255.0 + 0.5).clip(0, 255).astype("uint8")
-    return Image.fromarray(arr)
+    factor = float(job_input.get("upscale", DEFAULT_UPSCALE) or 1.0)
+    if factor > 1.0:
+        add_upscale(prompt, factor, job_input.get("upscale_model") or UPSCALE_MODEL)
+    return prompt
 
 
-def upscale(img: Image.Image, factor: float) -> Image.Image:
-    if factor <= 1.0:
-        return img
-    target = (round(img.width * factor), round(img.height * factor))
-    big = esrgan_upscale(img)  # x4
-    return big.resize(target, Image.LANCZOS) if big.size != target else big
+# ───────────────────────── output ─────────────────────────
 
-
-def encode(img: Image.Image, fmt: str) -> str:
-    buf = io.BytesIO()
-    if fmt == "jpeg":
-        img.save(buf, "JPEG", quality=95, subsampling=0)
-    elif fmt == "webp":
-        img.save(buf, "WEBP", quality=95)
-    else:
-        img.save(buf, "PNG", compress_level=4)
-    return f"data:image/{fmt};base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+def encode_output(raw: bytes, fmt: str, quality: int):
+    """(data URI, width, height). ComfyUI saves PNG; convert only if asked to."""
+    with Image.open(io.BytesIO(raw)) as im:
+        width, height = im.size
+        if fmt == "png":
+            return "data:image/png;base64," + base64.b64encode(raw).decode("ascii"), width, height
+        buf = io.BytesIO()
+        if fmt == "jpeg":
+            im.convert("RGB").save(buf, "JPEG", quality=quality, subsampling=0)
+        else:
+            im.save(buf, "WEBP", quality=quality)
+        data = buf.getvalue()
+    return f"data:image/{fmt};base64," + base64.b64encode(data).decode("ascii"), width, height
 
 
 # ───────────────────────── handler ─────────────────────────
 
 def handler(job):
-    inp = job.get("input") or {}
+    job_input = job.get("input") or {}
+    t0 = time.time()
+    image_paths = []
     try:
-        prompt = (inp.get("prompt") or "").strip()
-        if not prompt:
+        prompt_text = (job_input.get("prompt") or "").strip()
+        if not prompt_text:
             return {"error": "prompt is required"}
-        if not inp.get("image_base64"):
-            return {"error": "image_base64 is required"}
-        factor = float(inp.get("upscale", 1.0))
+        job_input["prompt"] = prompt_text
+
+        factor = float(job_input.get("upscale", DEFAULT_UPSCALE) or 1.0)
         if not (1.0 <= factor <= MAX_UPSCALE):
-            return {"error": f"upscale must be between 1 and {MAX_UPSCALE}"}
-        fmt = str(inp.get("output_format", "png")).lower().replace("jpg", "jpeg")
+            return {"error": f"upscale must be between 1 and {MAX_UPSCALE:g}"}
+        fmt = str(job_input.get("output_format", "png")).lower().replace("jpg", "jpeg")
         if fmt not in ("png", "jpeg", "webp"):
             return {"error": "output_format must be png, jpeg or webp"}
-        steps = int(inp.get("steps") or DEFAULT_STEPS)
-        cfg = float(inp.get("true_cfg_scale") or DEFAULT_CFG)
-        edit_mp = min(max(float(inp.get("edit_mp") or 1.0), 0.25), 2.0)
-        seed = inp.get("seed")
+        quality = int(job_input.get("jpeg_quality") or 95)
+
+        seed = job_input.get("seed")
         seed = random.randint(0, 2**31 - 1) if seed is None or int(seed) < 0 else int(seed)
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        t0 = time.time()
-        main = decode_image(inp["image_base64"])
-        images = [main]
-        if inp.get("reference_image_base64"):
-            images.append(decode_image(inp["reference_image_base64"]))
-        w, h = edit_size(main.width, main.height, edit_mp)
+        temp_dir = os.path.join("/tmp", f"task_{uuid.uuid4().hex}")
+        for slot in (1, 2, 3):
+            path = resolve_image(job_input, slot, temp_dir)
+            if path is None:
+                break           # Picture 3 without Picture 2 is not a thing
+            image_paths.append(path)
+        if not image_paths:
+            return {"error": "an image is required (image_base64, image_url or image_path)"}
 
-        result = PIPE(
-            image=images,
-            prompt=prompt,
-            negative_prompt=inp.get("negative_prompt") or " ",
-            true_cfg_scale=cfg,
-            guidance_scale=1.0,
-            num_inference_steps=steps,
-            width=w,
-            height=h,
-            generator=torch.Generator(device="cpu").manual_seed(seed),
-            num_images_per_prompt=1,
-        ).images[0]
-        t_edit = time.time() - t0
-        peak_edit = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+        logger.info(f"job: {len(image_paths)} image(s), seed {seed}, upscale x{factor:g}, "
+                    f"steps {job_input.get('steps') or DEFAULT_STEPS}, format {fmt}")
+        graph = build_prompt(job_input, image_paths, seed)
 
+        wait_for_comfyui(BOOT_TIMEOUT)
         t1 = time.time()
-        if factor > 1.0 and torch.cuda.is_available():
-            # release the diffusion workspace before the upscaler allocates its own
-            torch.cuda.empty_cache()
-        result = upscale(result, factor)
-        t_up = time.time() - t1
+        images = run_workflow(graph, JOB_TIMEOUT)
+        comfy_s = time.time() - t1
 
+        data_uri, width, height = encode_output(images[0], fmt, quality)
+        extra = [encode_output(raw, fmt, quality)[0] for raw in images[1:]]
+        logger.info(f"done: {width}x{height} in {comfy_s:.1f}s on the GPU")
         return {
-            "image": encode(result, fmt),
-            "width": result.width,
-            "height": result.height,
+            "image": data_uri,
+            "images": [data_uri] + extra,
+            "width": width,
+            "height": height,
             "seed": seed,
-            "timings": {"edit_s": round(t_edit, 2), "upscale_s": round(t_up, 2), "steps": steps,
-                        "peak_edit_gb": round(peak_edit, 1),
-                        "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1)
-                        if torch.cuda.is_available() else 0},
+            "upscale": factor,
+            "timings": {"total_s": round(time.time() - t0, 2),
+                        "comfy_s": round(comfy_s, 2),
+                        "gpu_s": round(comfy_s, 2),
+                        "steps": graph[NODE_SAMPLER]["inputs"]["steps"]},
         }
-    except torch.cuda.OutOfMemoryError:
-        peak = torch.cuda.max_memory_allocated() / 1e9
-        reserved = torch.cuda.max_memory_reserved() / 1e9
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        weights = RESIDENT_GB
-        torch.cuda.empty_cache()
-        return {"error": f"CUDA out of memory: {total:.1f} GB card, {weights:.1f} GB of "
-                         f"resident weights, peak {peak:.1f} GB allocated / {reserved:.1f} GB "
-                         f"reserved. Try upscale=1, edit_mp<=0.7, a 48 GB GPU, "
-                         f"or CPU_OFFLOAD=1"}
-    except Exception as e:  # report to the client instead of crashing the worker
-        log.exception("job failed")
+    except Exception as e:
+        logger.exception("job failed")
         return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        # only the files this request materialized; an image_path input is the caller's
+        for path in image_paths:
+            if path.startswith("/tmp/task_"):
+                try:
+                    os.remove(path)
+                    os.rmdir(os.path.dirname(path))
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":
-    init()
     runpod.serverless.start({"handler": handler})

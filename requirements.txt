@@ -1,12 +1,6 @@
-runpod>=1.7
-diffusers>=0.36.0
-transformers>=4.51
-accelerate>=1.2
-peft>=0.15
-safetensors
-huggingface_hub
-gguf>=0.13
-bitsandbytes>=0.45
-spandrel>=0.4
+# Handler dependencies. The Docker image installs these (plus ComfyUI's own
+# requirements) explicitly; this file is for local runs and for RunPod's hub build.
+runpod
+websocket-client
 pillow
-numpy
+requests
