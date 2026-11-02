@@ -1,0 +1,50 @@
+{
+  "title": "Qwen-Image-Edit-2511 + Real-ESRGAN Upscale",
+  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 and the Lightning 4-step LoRA, followed by optional Real-ESRGAN x4plus upscaling. Accepts a base64 image plus an edit prompt and an optional style reference image.",
+  "type": "serverless",
+  "category": "image",
+  "config": {
+    "runsOn": "GPU",
+    "gpuCount": 1,
+    "gpuIds": "ADA_80_PRO,AMPERE_80",
+    "containerDiskInGb": 40,
+    "env": [
+      {
+        "key": "MODEL_ID",
+        "input": {
+          "name": "Base model",
+          "type": "string",
+          "description": "Hugging Face repo id of the Qwen-Image-Edit base model.",
+          "default": "Qwen/Qwen-Image-Edit-2511"
+        }
+      },
+      {
+        "key": "USE_LIGHTNING",
+        "input": {
+          "name": "Use Lightning LoRA",
+          "type": "boolean",
+          "description": "Few-step Lightning LoRA: much faster at 4-8 steps. Disable for full 40-step sampling.",
+          "default": true
+        }
+      },
+      {
+        "key": "DEFAULT_STEPS",
+        "input": {
+          "name": "Default inference steps",
+          "type": "number",
+          "description": "Used when a request omits \"steps\". 4-8 with Lightning, ~40 without.",
+          "default": 8
+        }
+      },
+      {
+        "key": "CPU_OFFLOAD",
+        "input": {
+          "name": "CPU offload",
+          "type": "boolean",
+          "description": "Enable on GPUs smaller than 80 GB. Slower and needs plenty of host RAM.",
+          "default": false
+        }
+      }
+    ]
+  }
+}
