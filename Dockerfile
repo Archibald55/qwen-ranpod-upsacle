@@ -32,4 +32,4 @@ hf_hub_download('lightx2v/Qwen-Image-Edit-2511-Lightning', \
 
 COPY handler.py .
 
-CMD ["python", "-u", "handler.py"]
+CMD ["python", "handler.py"]
