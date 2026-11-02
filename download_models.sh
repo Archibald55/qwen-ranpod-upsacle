@@ -16,14 +16,14 @@ DEST="${1:-${MODEL_DIR:-/ComfyUI/models}}"
 BAKED_DIR="${BAKED_DIR:-/ComfyUI/models}"
 LOCK_TIMEOUT="${LOCK_TIMEOUT:-3600}"
 
-# name|subdirectory|url
+# name|subdirectory|url|approximate size in MB (for the free-space check)
 MANIFEST=(
-"qwen_image_edit_2511_fp8mixed.safetensors|diffusion_models|https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors"
-"qwen_2.5_vl_7b_fp8_scaled.safetensors|text_encoders|https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
-"qwen_image_vae.safetensors|vae|https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors"
-"Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors|loras|https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
-"RealESRGAN_x4plus.pth|upscale_models|https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
-"4x-UltraSharp.pth|upscale_models|https://huggingface.co/Kim2091/UltraSharp/resolve/main/4x-UltraSharp.pth"
+"qwen_image_edit_2511_fp8mixed.safetensors|diffusion_models|https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors|20000"
+"qwen_2.5_vl_7b_fp8_scaled.safetensors|text_encoders|https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors|9400"
+"qwen_image_vae.safetensors|vae|https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors|260"
+"Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors|loras|https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors|1200"
+"RealESRGAN_x4plus.pth|upscale_models|https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth|70"
+"4x-UltraSharp.pth|upscale_models|https://huggingface.co/Kim2091/UltraSharp/resolve/main/4x-UltraSharp.pth|70"
 )
 
 have() {   # already present in the volume or baked into the image?
@@ -73,9 +73,36 @@ fetch() {
 }
 
 echo "model directory: $DEST"
+mkdir -p "$DEST"
+
+# Check there is room before starting. Out of space, wget reports the baffling
+# "Cannot write to '...' (Success)" and the real cause - usually models landing on a
+# small container disk because no network volume is attached - stays invisible.
+needed_mb=0
+for entry in "${MANIFEST[@]}"; do
+    IFS='|' read -r name sub url size_mb <<<"$entry"
+    have "$sub" "$name" || needed_mb=$((needed_mb + size_mb))
+done
+free_mb=$(df -Pk "$DEST" 2>/dev/null | awk 'NR==2 {print int($4 / 1024)}')
+if [ -n "$free_mb" ] && [ "$needed_mb" -gt 0 ]; then
+    echo "need $((needed_mb / 1024)) GB, $((free_mb / 1024)) GB free on $DEST"
+    if [ "$free_mb" -lt "$((needed_mb + 2048))" ]; then
+        echo "ERROR: not enough disk space: $((needed_mb / 1024)) GB of models still to" >&2
+        echo "       download but only $((free_mb / 1024)) GB free on $DEST." >&2
+        case "$DEST" in
+            /runpod-volume/*) echo "       Grow the network volume, or delete what else is on it." >&2 ;;
+            *) echo "       The models are going to the CONTAINER DISK, which is far too small" >&2
+               echo "       for them. Attach a network volume to the endpoint (it mounts at" >&2
+               echo "       /runpod-volume) so they are downloaded once and cached, or raise" >&2
+               echo "       the endpoint's container disk above $(((needed_mb + 2048) / 1024)) GB." >&2 ;;
+        esac
+        exit 1
+    fi
+fi
+
 pids=()
 for entry in "${MANIFEST[@]}"; do
-    IFS='|' read -r name sub url <<<"$entry"
+    IFS='|' read -r name sub url size_mb <<<"$entry"
     fetch "$name" "$sub" "$url" &
     pids+=("$!")
 done
