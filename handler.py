@@ -88,9 +88,18 @@ def resolve_model_path(model_id: str) -> str:
             if os.path.isfile(os.path.join(path, "model_index.json")):
                 log.info(f"using cached model at {path}")
                 return path
-    log.warning(f"{model_id} not found in {CACHE_ROOT}; components will download on demand "
-                f"(text encoder ~16 GB, or ~58 GB unquantized). "
-                f"Set the endpoint's Model field to {model_id} to cache it.")
+    root = CACHE_ROOT
+    if not os.path.isdir("/runpod-volume"):
+        why = "/runpod-volume does not exist: no network volume and no cached model on this endpoint"
+    elif not os.path.isdir(root):
+        why = f"{root} does not exist: the endpoint has no cached model"
+    else:
+        have = sorted(n for n in os.listdir(root) if n.startswith("models--"))
+        why = (f"{root} holds {have or 'nothing'}: the Model field names a different model "
+               f"(it must read exactly {model_id})")
+    log.warning(f"{model_id} not cached - {why}. Components will download on demand "
+                f"(text encoder ~16 GB, or ~58 GB unquantized) on every cold worker. "
+                f"Fix: endpoint -> Manage -> Edit Endpoint -> Model = {model_id}")
     return model_id
 
 
@@ -126,7 +135,7 @@ def load_transformer_bnb4(base_path: str):
 
     src, sub = component_source(base_path, "transformer")
     return QwenImageTransformer2DModel.from_pretrained(
-        src, subfolder=sub, torch_dtype=torch.bfloat16,
+        src, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": 0},
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True),
@@ -144,6 +153,45 @@ def load_text_encoder_4bit(base_path: str):
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True),
     )
+
+
+def quant_method(mod) -> str:
+    """Name of the quantizer backing this module, or "" if it is not quantized."""
+    for owner in (getattr(mod, "config", None), getattr(mod, "hf_quantizer", None)):
+        qc = getattr(owner, "quantization_config", None)
+        if qc is not None:
+            m = getattr(qc, "quant_method", None) or getattr(qc, "quantization_method", None)
+            if m is not None:
+                return str(getattr(m, "value", m)).lower()
+    return ""
+
+
+def place(pipe, names=("transformer", "text_encoder", "vae")):
+    """Move components onto the GPU.
+
+    bitsandbytes modules are placed at load time (device_map) and raise on .to();
+    GGUF modules load on the CPU and must be moved, so a blanket "skip quantized"
+    check leaves the transformer on the CPU and every matmul then fails with
+    "Expected all tensors to be on the same device".
+    """
+    for name in names:
+        mod = getattr(pipe, name, None)
+        if mod is None or not hasattr(mod, "to"):
+            continue
+        method = quant_method(mod)
+        if "bitsandbytes" in method:
+            pass  # already on its load-time device
+        else:
+            try:
+                mod.to(DEVICE)
+            except (ValueError, NotImplementedError) as e:
+                log.info(f"{name}: not movable ({e}); keeping its load-time device")
+        try:
+            prm = next(mod.parameters(), None)
+            log.info(f"{name}: device={prm.device if prm is not None else '?'} "
+                     f"quant={method or 'none'}")
+        except Exception:
+            pass
 
 
 def load_pipeline():
@@ -165,12 +213,8 @@ def load_pipeline():
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(base, **kwargs)
     if not CPU_OFFLOAD:
-        # Quantized components are already placed, and pipe.to() rejects 4-bit modules,
-        # so move the rest one by one instead of pipe.to(DEVICE).
-        for name in ("transformer", "text_encoder", "vae"):
-            mod = getattr(pipe, name, None)
-            if mod is not None and not getattr(mod, "is_quantized", False):
-                mod.to(DEVICE)
+        # pipe.to(DEVICE) rejects bitsandbytes modules, so place each one individually.
+        place(pipe)
     if USE_LIGHTNING:
         pipe.load_lora_weights(os.path.dirname(LORA_PATH), weight_name=os.path.basename(LORA_PATH),
                                adapter_name="lightning")
