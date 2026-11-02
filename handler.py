@@ -291,8 +291,21 @@ def load_upscaler():
     return model, half
 
 
-PIPE = load_pipeline()
-UPSCALER, UPSCALER_HALF = load_upscaler()
+PIPE = None
+UPSCALER, UPSCALER_HALF = None, False
+
+
+def init():
+    """Load the models. Called from __main__ before serving, or by a test harness.
+
+    Kept out of import time so handler.py can be imported and exercised without
+    loading 13 GB of weights.
+    """
+    global PIPE, UPSCALER, UPSCALER_HALF
+    if PIPE is None:
+        PIPE = load_pipeline()
+    if UPSCALER is None:
+        UPSCALER, UPSCALER_HALF = load_upscaler()
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -425,4 +438,5 @@ def handler(job):
 
 
 if __name__ == "__main__":
+    init()
     runpod.serverless.start({"handler": handler})

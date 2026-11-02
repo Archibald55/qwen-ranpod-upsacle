@@ -4,6 +4,25 @@ Edits each photo with Qwen-Image-Edit-2511 (Q4_K_M GGUF + Lightning LoRA, 8 step
 then upscales with Real-ESRGAN x4 and resizes to the requested factor
 (`upscale: 2` → ~4 MP). The API matches the FLUX worker, so `qwen_enhance_batch.py` works with it.
 
+## 0. Test on a GPU pod first
+
+Do not debug this on serverless: every fix costs an image build plus a cold start.
+Rent an on-demand **GPU Pod** (24 GB, billed per minute), and iterate there in seconds.
+
+```bash
+git clone YOUR_REPO && cd qwen-worker
+pip install -r requirements.txt
+# either let it download the quant, or put it somewhere and point GGUF_PATH at it
+export GGUF_PATH=/workspace/qwen-image-edit-2511-Q4_K_M.gguf
+python smoke_gpu.py                 # loads the model, runs 1 edit, prints per-stage timing
+python smoke_gpu.py photo.jpg       # with a real photo
+```
+
+`smoke_gpu.py` reports GPU name and VRAM, whether the GGUF was found, how long each
+load stage took, free host RAM at each step, peak VRAM, and a warm second pass (the
+steady-state time per image). Exit code 0 means an image came back. Only build the
+serverless image once this passes.
+
 ## 1. Build and push the image
 
 ```bash
