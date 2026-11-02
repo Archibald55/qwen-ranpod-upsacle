@@ -58,6 +58,11 @@ GGUF_CONFIG_DIR = os.getenv("GGUF_CONFIG_DIR", "/models/transformer")
 LOCAL_BASE = os.getenv("LOCAL_BASE", "/models/base")
 # 1 = refuse to start rather than silently downloading ~16 GB on every cold worker.
 REQUIRE_LOCAL = os.getenv("REQUIRE_LOCAL", "0") == "1"
+# VAE decode at ~1 MP spikes several GB in one allocation; tiling caps it.
+VAE_TILING = os.getenv("VAE_TILING", "1") == "1"
+# Trades a little speed for a much smaller attention peak. On by default when quantized,
+# where the weights already eat most of a 24 GB card.
+ATTENTION_SLICING = os.getenv("ATTENTION_SLICING", "") or ""
 BASE_MODEL_BAKED = os.getenv("BASE_MODEL_BAKED", "")
 # NF4-quantize the Qwen2.5-VL text encoder (16 GB bf16 -> ~5.5 GB). Required on 24 GB.
 TEXT_ENCODER_4BIT = os.getenv("TEXT_ENCODER_4BIT", "1" if QUANT != "off" else "0") == "1"
@@ -281,7 +286,23 @@ def load_pipeline():
             pipe.set_adapters(["lightning"], adapter_weights=[1.0])
     if CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
+    if VAE_TILING:
+        for fn in ("enable_tiling", "enable_slicing"):
+            try:
+                getattr(pipe.vae, fn)()
+            except Exception as e:
+                log.info(f"vae.{fn}() unavailable: {e}")
+        log.info("vae tiling + slicing on")
+    slicing = ATTENTION_SLICING or ("1" if QUANT != "off" else "0")
+    if slicing not in ("0", "off", "false"):
+        try:
+            pipe.enable_attention_slicing("auto" if slicing in ("1", "auto", "true") else int(slicing))
+            log.info(f"attention slicing on ({slicing})")
+        except Exception as e:
+            log.info(f"attention slicing unavailable: {e}")
     pipe.set_progress_bar_config(disable=True)
+    global RESIDENT_GB
+    RESIDENT_GB = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
     free = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
     log.info(f"pipeline ready in {time.time() - t0:.0f}s (quant={QUANT}, te4bit={TEXT_ENCODER_4BIT}, "
              f"lightning={USE_LIGHTNING}, offload={CPU_OFFLOAD}); "
@@ -305,6 +326,7 @@ def load_upscaler():
 
 PIPE = None
 UPSCALER, UPSCALER_HALF = None, False
+RESIDENT_GB = 0.0     # GPU memory the loaded weights occupy, for the OOM message
 
 
 def init():
@@ -409,6 +431,8 @@ def handler(job):
         seed = inp.get("seed")
         seed = random.randint(0, 2**31 - 1) if seed is None or int(seed) < 0 else int(seed)
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         main = decode_image(inp["image_base64"])
         images = [main]
@@ -429,8 +453,12 @@ def handler(job):
             num_images_per_prompt=1,
         ).images[0]
         t_edit = time.time() - t0
+        peak_edit = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
 
         t1 = time.time()
+        if factor > 1.0 and torch.cuda.is_available():
+            # release the diffusion workspace before the upscaler allocates its own
+            torch.cuda.empty_cache()
         result = upscale(result, factor)
         t_up = time.time() - t1
 
@@ -439,11 +467,21 @@ def handler(job):
             "width": result.width,
             "height": result.height,
             "seed": seed,
-            "timings": {"edit_s": round(t_edit, 2), "upscale_s": round(t_up, 2), "steps": steps},
+            "timings": {"edit_s": round(t_edit, 2), "upscale_s": round(t_up, 2), "steps": steps,
+                        "peak_edit_gb": round(peak_edit, 1),
+                        "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1)
+                        if torch.cuda.is_available() else 0},
         }
     except torch.cuda.OutOfMemoryError:
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        reserved = torch.cuda.max_memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        weights = RESIDENT_GB
         torch.cuda.empty_cache()
-        return {"error": "CUDA out of memory - lower edit_mp, use a smaller GGUF_FILE, a bigger GPU, or set CPU_OFFLOAD=1"}
+        return {"error": f"CUDA out of memory: {total:.1f} GB card, {weights:.1f} GB of "
+                         f"resident weights, peak {peak:.1f} GB allocated / {reserved:.1f} GB "
+                         f"reserved. Try upscale=1, edit_mp<=0.7, a 48 GB GPU, "
+                         f"or CPU_OFFLOAD=1"}
     except Exception as e:  # report to the client instead of crashing the worker
         log.exception("job failed")
         return {"error": f"{type(e).__name__}: {e}"}

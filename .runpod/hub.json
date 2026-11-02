@@ -1,12 +1,12 @@
 {
   "title": "Qwen-Image-Edit-2511 + Real-ESRGAN Upscale",
-  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 (Q4_K_M GGUF) and the Lightning 4-step LoRA, followed by optional Real-ESRGAN x4plus upscaling. Runs on a 24 GB GPU. Accepts a base64 image plus an edit prompt and an optional style reference image.",
+  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 (Q4_K_M GGUF) and the Lightning 4-step LoRA, followed by optional Real-ESRGAN x4plus upscaling. Runs on a 48 GB GPU (24 GB works with upscale<=2 and edit_mp<=0.8). Accepts a base64 image plus an edit prompt and an optional style reference image.",
   "type": "serverless",
   "category": "image",
   "config": {
     "runsOn": "GPU",
     "gpuCount": 1,
-    "gpuIds": "ADA_24,AMPERE_24,ADA_48_PRO,AMPERE_48",
+    "gpuIds": "ADA_48_PRO,AMPERE_48,ADA_24,AMPERE_24",
     "containerDiskInGb": 40,
     "env": [
       {
@@ -25,9 +25,18 @@
           "type": "string",
           "description": "gguf = Q4_K_M transformer (24 GB GPUs). bnb4 = NF4 instead. off = bf16, needs 80 GB.",
           "options": [
-            { "label": "GGUF Q4_K_M (24 GB)", "value": "gguf" },
-            { "label": "bitsandbytes NF4", "value": "bnb4" },
-            { "label": "Off - bf16 (80 GB)", "value": "off" }
+            {
+              "label": "GGUF Q4_K_M (24 GB)",
+              "value": "gguf"
+            },
+            {
+              "label": "bitsandbytes NF4",
+              "value": "bnb4"
+            },
+            {
+              "label": "Off - bf16 (80 GB)",
+              "value": "off"
+            }
           ],
           "default": "gguf"
         }
@@ -39,9 +48,18 @@
           "type": "string",
           "description": "Only the baked-in file loads without a download. Larger quants need a bigger GPU.",
           "options": [
-            { "label": "Q4_K_M - 12.8 GB (baked in)", "value": "qwen-image-edit-2511-Q4_K_M.gguf" },
-            { "label": "Q5_K_M - 15.4 GB", "value": "qwen-image-edit-2511-Q5_K_M.gguf" },
-            { "label": "Q6_K - 17.9 GB", "value": "qwen-image-edit-2511-Q6_K.gguf" }
+            {
+              "label": "Q4_K_M - 12.8 GB (baked in)",
+              "value": "qwen-image-edit-2511-Q4_K_M.gguf"
+            },
+            {
+              "label": "Q5_K_M - 15.4 GB",
+              "value": "qwen-image-edit-2511-Q5_K_M.gguf"
+            },
+            {
+              "label": "Q6_K - 17.9 GB",
+              "value": "qwen-image-edit-2511-Q6_K.gguf"
+            }
           ],
           "default": "qwen-image-edit-2511-Q4_K_M.gguf"
         }

@@ -40,7 +40,7 @@ GitHub repo**; RunPod builds the Dockerfile for you.
 |---|---|
 | Container image | `YOUR_DOCKERHUB_USER/qwen-edit-upscale:v2` |
 | **Model (cached model)** | `Qwen/Qwen-Image-Edit-2511` ← important, avoids a 16 GB text-encoder download per worker |
-| GPU | **24 GB** (RTX 4090, L4 or A5000). 48 GB also works and is less contended |
+| GPU | **48 GB** (L40S, L40 or A40). 24 GB works but is tight - see the VRAM table below |
 | Container disk | 40 GB (the image carries the 12.8 GB quant) |
 | Active workers | 0 |
 | Max workers | 4 (match `--workers` in the batch script) |
@@ -61,6 +61,29 @@ GitHub repo**; RunPod builds the Dockerfile for you.
 | `LOCAL_BASE` | /models/base | components baked into the image (used before RunPod's cache) |
 | `CPU_OFFLOAD` | 0 | Last resort if the GPU still OOMs (slow; needs ~64 GB RAM) |
 | `UPSCALE_TILE` | 512 | upscaler tile size; lower if you ever hit OOM there |
+| `VAE_TILING` | 1 | tile+slice VAE decode; caps a multi-GB spike at ~1 MP |
+| `ATTENTION_SLICING` | auto | on when quantized; `0` to disable, or a slice size |
+
+### VRAM budget
+
+Resident weights, before any activations:
+
+| Config | Transformer | Text encoder | Resident | Fits 24 GB? | Fits 48 GB? |
+|---|---|---|---|---|---|
+| Q4_K_M + NF4 | 12.8 GB | 5.5 GB | **18.3 GB** | tight | yes |
+| Q5_K_M + NF4 | 15.4 GB | 5.5 GB | 20.9 GB | no | yes |
+| Q6_K + NF4 | 17.9 GB | 5.5 GB | 23.4 GB | no | yes |
+| `QUANT=off` (bf16) | 40 GB | 16 GB | 57.5 GB | no | no (80 GB) |
+
+A 24 GB card leaves only ~5 GB for activations after Q4_K_M + NF4, which is not enough
+at `edit_mp 1.0` with the x4 upscaler in the same process. On 24 GB use `upscale <= 2`
+and `edit_mp <= 0.8`; VAE tiling and attention slicing are on by default and already
+included in that. 48 GB costs about 19% more per second and removes the problem, and
+lets you run Q6_K for better fidelity - worth it when the prompt's first rule is
+preserving the object exactly.
+
+The worker reports `peak_edit_gb` and `peak_gb` in every response's `timings`, so you
+can see the real headroom instead of guessing.
 
 ### Stopping the per-worker download
 
