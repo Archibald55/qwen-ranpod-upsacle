@@ -33,6 +33,15 @@ hf_hub_download('${GGUF_REPO}', '${GGUF_FILE}', local_dir='/models/transformer')
     && rm -rf /models/transformer/.cache
 ENV GGUF_PATH=/models/transformer/${GGUF_FILE}
 
+# transformer/config.json next to the GGUF: from_single_file needs the architecture
+# config, and without this it is fetched from the Hub in the middle of every cold start.
+ARG BASE_MODEL=Qwen/Qwen-Image-Edit-2511
+RUN python -c "import shutil; from huggingface_hub import hf_hub_download; \
+cfg = hf_hub_download('${BASE_MODEL}', 'transformer/config.json'); \
+shutil.copy(cfg, '/models/transformer/config.json')" \
+    && rm -rf /root/.cache/huggingface
+ENV BASE_MODEL_BAKED=${BASE_MODEL}
+
 # Lightning 4-step LoRA (works at 4 or 8 steps) + Real-ESRGAN x4plus upscaler
 RUN mkdir -p /models/lora /models/upscale \
     && python -c "from huggingface_hub import hf_hub_download; \

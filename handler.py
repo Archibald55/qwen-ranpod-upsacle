@@ -50,6 +50,10 @@ QUANT = os.getenv("QUANT", "gguf").lower()
 GGUF_PATH = os.getenv("GGUF_PATH", "/models/transformer/qwen-image-edit-2511-Q4_K_M.gguf")
 GGUF_REPO = os.getenv("GGUF_REPO", "unsloth/Qwen-Image-Edit-2511-GGUF")
 GGUF_FILE = os.getenv("GGUF_FILE", "qwen-image-edit-2511-Q4_K_M.gguf")
+# transformer/config.json baked next to the GGUF, so loading needs no network call.
+# BASE_MODEL_BAKED records which model it came from: ignored if MODEL_ID differs.
+GGUF_CONFIG_DIR = os.getenv("GGUF_CONFIG_DIR", "/models/transformer")
+BASE_MODEL_BAKED = os.getenv("BASE_MODEL_BAKED", "")
 # NF4-quantize the Qwen2.5-VL text encoder (16 GB bf16 -> ~5.5 GB). Required on 24 GB.
 TEXT_ENCODER_4BIT = os.getenv("TEXT_ENCODER_4BIT", "1" if QUANT != "off" else "0") == "1"
 DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "8" if USE_LIGHTNING else "40"))
@@ -78,6 +82,20 @@ LIGHTNING_SCHEDULER = {
 
 
 # ───────────────────────── model loading (once per worker) ─────────────────────────
+
+def mem() -> str:
+    """Host RAM available and GPU allocated, for spotting a load that is swapping."""
+    out = []
+    try:
+        with open("/proc/meminfo") as f:
+            info = {k: v for k, v in (l.split(":", 1) for l in f)}
+        out.append(f"ram_free {int(info['MemAvailable'].split()[0]) / 1e6:.1f} GB")
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        out.append(f"gpu {torch.cuda.memory_allocated() / 1e9:.1f} GB")
+    return ", ".join(out)
+
 
 def resolve_model_path(model_id: str) -> str:
     """Use RunPod's cached model if the endpoint has one, else fall back to downloading."""
@@ -120,13 +138,26 @@ def load_transformer_gguf(base_path: str):
         from huggingface_hub import hf_hub_download
         log.warning(f"{GGUF_PATH} not baked in; downloading {GGUF_REPO}/{GGUF_FILE}")
         path = hf_hub_download(GGUF_REPO, GGUF_FILE)
-    cfg_src, cfg_sub = component_source(base_path, "transformer")
+    # Prefer the baked config: with no cached model, a repo id here means a Hub
+    # round-trip in the middle of the load.
+    if BASE_MODEL_BAKED == MODEL_ID and os.path.isfile(os.path.join(GGUF_CONFIG_DIR, "config.json")):
+        cfg_src, cfg_sub = GGUF_CONFIG_DIR, None
+    else:
+        cfg_src, cfg_sub = component_source(base_path, "transformer")
+        if cfg_src == base_path and not os.path.isdir(base_path):
+            log.warning(f"transformer config will be fetched from the Hub ({base_path}); "
+                        f"bake it or cache the model to avoid a network call during load")
     kwargs = {"config": cfg_src, "torch_dtype": torch.bfloat16,
               "quantization_config": GGUFQuantizationConfig(compute_dtype=torch.bfloat16)}
     if cfg_sub:
         kwargs["subfolder"] = cfg_sub
-    log.info(f"loading GGUF transformer {os.path.basename(path)}")
-    return QwenImageTransformer2DModel.from_single_file(path, **kwargs)
+    gb = os.path.getsize(path) / 1e9
+    log.info(f"loading GGUF transformer {os.path.basename(path)} ({gb:.1f} GB), "
+             f"config from {cfg_src}; {mem()}")
+    t = time.time()
+    tr = QwenImageTransformer2DModel.from_single_file(path, **kwargs)
+    log.info(f"transformer read in {time.time() - t:.0f}s; {mem()}")
+    return tr
 
 
 def load_transformer_bnb4(base_path: str):
@@ -146,7 +177,7 @@ def load_text_encoder_4bit(base_path: str):
     from transformers import BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
 
     src, sub = component_source(base_path, "text_encoder")
-    log.info("loading NF4 text encoder")
+    log.info(f"loading NF4 text encoder from {src}; {mem()}")
     return Qwen2_5_VLForConditionalGeneration.from_pretrained(
         src, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": 0},
         quantization_config=BitsAndBytesConfig(
@@ -203,19 +234,30 @@ def load_pipeline():
     if USE_LIGHTNING:
         kwargs["scheduler"] = FlowMatchEulerDiscreteScheduler.from_config(LIGHTNING_SCHEDULER)
     if QUANT == "gguf":
-        kwargs["transformer"] = load_transformer_gguf(base)
+        tr = load_transformer_gguf(base)
+        if not CPU_OFFLOAD:
+            # Move it now rather than in place() below: a GGUF transformer is built in
+            # host RAM, and holding 12.8 GB there while the text encoder reads and
+            # quantizes 16 GB of shards can exhaust a serverless worker's RAM and swap.
+            t = time.time()
+            tr.to(DEVICE)
+            log.info(f"transformer -> {DEVICE} in {time.time() - t:.0f}s; {mem()}")
+        kwargs["transformer"] = tr
     elif QUANT == "bnb4":
         kwargs["transformer"] = load_transformer_bnb4(base)
     elif QUANT != "off":
         raise ValueError(f"QUANT must be gguf, bnb4 or off (got {QUANT!r})")
     if TEXT_ENCODER_4BIT:
         kwargs["text_encoder"] = load_text_encoder_4bit(base)
+        log.info(f"text encoder ready; {mem()}")
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(base, **kwargs)
+    log.info(f"pipeline assembled; {mem()}")
     if not CPU_OFFLOAD:
         # pipe.to(DEVICE) rejects bitsandbytes modules, so place each one individually.
         place(pipe)
     if USE_LIGHTNING:
+        log.info(f"loading Lightning LoRA; {mem()}")
         pipe.load_lora_weights(os.path.dirname(LORA_PATH), weight_name=os.path.basename(LORA_PATH),
                                adapter_name="lightning")
         if QUANT == "off":
