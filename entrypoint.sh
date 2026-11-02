@@ -61,6 +61,47 @@ fi
 # CUDA 환경 변수 설정
 echo "Using CUDA device: $CUDA_VISIBLE_DEVICES"
 
+# ── Models ──────────────────────────────────────────────────────────────────────
+# The ~31 GB model set is not baked into the image: a RunPod hub build cannot export
+# and upload that much inside its 30-minute limit. Instead it is fetched on the first
+# cold worker into MODEL_DIR, which should live on a network volume so the download is
+# paid once per volume rather than once per worker.
+if [ -z "${MODEL_DIR:-}" ]; then
+    if [ -d /runpod-volume ]; then
+        MODEL_DIR=/runpod-volume/ComfyUI-models
+    else
+        MODEL_DIR=/ComfyUI/models
+        echo "⚠️  No network volume attached (/runpod-volume is missing), so models go to"
+        echo "⚠️  the container disk and EVERY cold worker re-downloads ~31 GB, billed as"
+        echo "⚠️  runtime. Attach a network volume to the endpoint to fetch them once."
+        if [ "${REQUIRE_VOLUME:-0}" = "1" ]; then
+            echo "Error: REQUIRE_VOLUME=1 and no network volume is attached. Exiting..."
+            exit 1
+        fi
+    fi
+fi
+export MODEL_DIR
+
+if [ "${SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
+    echo "Preparing models in $MODEL_DIR ..."
+    /download_models.sh "$MODEL_DIR" || exit 1
+fi
+
+# Point ComfyUI at MODEL_DIR in addition to its own models directory. These paths are
+# appended to the search list, so anything baked into /ComfyUI/models still resolves.
+if [ "$MODEL_DIR" != "/ComfyUI/models" ]; then
+    cat > /ComfyUI/extra_model_paths.yaml <<YAML
+volume:
+    base_path: $MODEL_DIR
+    diffusion_models: diffusion_models
+    text_encoders: text_encoders
+    vae: vae
+    loras: loras
+    upscale_models: upscale_models
+YAML
+    echo "Wrote /ComfyUI/extra_model_paths.yaml -> $MODEL_DIR"
+fi
+
 # Start ComfyUI in the background
 echo "Starting ComfyUI in the background..."
 python /ComfyUI/main.py --listen --use-sage-attention &

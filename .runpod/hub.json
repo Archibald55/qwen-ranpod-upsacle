@@ -1,14 +1,32 @@
 {
   "title": "Qwen-Image-Edit-2511 + Upscale",
-  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 (fp8) and the Lightning 4-step LoRA, running on ComfyUI, with an optional Real-ESRGAN / UltraSharp upscale pass on the result. Takes 1-3 images as base64, URL or container path plus an edit prompt; returns the edited image at up to 4x the edit resolution.",
+  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 (fp8) and the Lightning 4-step LoRA, running on ComfyUI, with an optional Real-ESRGAN / UltraSharp upscale pass on the result. Takes 1-3 images as base64, URL or container path plus an edit prompt; returns the edited image at up to 4x the edit resolution. Attach a network volume: the ~31 GB model set is downloaded once onto it on the first cold worker.",
   "type": "serverless",
   "category": "image",
   "config": {
     "runsOn": "GPU",
     "gpuCount": 1,
     "gpuIds": "ADA_24,ADA_32_PRO,ADA_48_PRO,AMPERE_48",
-    "containerDiskInGb": 180,
+    "containerDiskInGb": 100,
     "env": [
+      {
+        "key": "MODEL_DIR",
+        "input": {
+          "name": "Model directory",
+          "type": "string",
+          "description": "Where the model set is cached. Defaults to /runpod-volume/ComfyUI-models when a network volume is attached, otherwise the container disk.",
+          "default": ""
+        }
+      },
+      {
+        "key": "REQUIRE_VOLUME",
+        "input": {
+          "name": "Require a network volume",
+          "type": "boolean",
+          "description": "Refuse to start without a network volume, rather than re-downloading ~31 GB on every cold worker.",
+          "default": false
+        }
+      },
       {
         "key": "DEFAULT_STEPS",
         "input": {

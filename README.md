@@ -6,8 +6,11 @@ on the result.
 
 The worker runs ComfyUI inside the container and drives it over its HTTP/websocket API,
 following the [wlsdml1114/qwen_image_edit](https://github.com/wlsdml1114/qwen_image_edit)
-template. Everything (model, LoRA, text encoder, VAE, upscalers) is baked into the image,
-so a cold worker downloads nothing — no network volume needed.
+template.
+
+> **Attach a network volume to the endpoint.** The model set (~31 GB) is not baked into
+> the image — see [Models](#models) — and is downloaded onto the volume by the first
+> cold worker, once per volume.
 
 ## Request
 
@@ -77,10 +80,42 @@ resize. With `upscale: 1` the graph is left untouched.
 Because the upscale runs as ComfyUI nodes, it is tiled and VRAM-bounded by ComfyUI
 itself; a 4x pass on a 1 MP edit fits on a 24 GB card.
 
+## Models
+
+| file | size | where |
+| --- | --- | --- |
+| `qwen_image_edit_2511_fp8mixed.safetensors` | ~20 GB | `diffusion_models/` |
+| `qwen_2.5_vl_7b_fp8_scaled.safetensors` | ~9 GB | `text_encoders/` |
+| `Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors` | ~1.2 GB | `loras/` |
+| `qwen_image_vae.safetensors` | ~250 MB | `vae/` |
+| `RealESRGAN_x4plus.pth`, `4x-UltraSharp.pth` | ~64 MB each | `upscale_models/` |
+
+None of this is baked into the image. A RunPod **hub build cannot export and upload a
+~31 GB layer inside its 30-minute limit** — it dies in `exporting layers` /
+`sending tarball` with `Build timeout exceeded`. So `entrypoint.sh` runs
+`download_models.sh` before starting ComfyUI, which fetches whatever is missing from
+`MODEL_DIR` in parallel, under a per-file lock and via `.part` files, so several cold
+workers sharing one volume cooperate instead of fighting. ComfyUI is then pointed at
+`MODEL_DIR` through a generated `extra_model_paths.yaml`.
+
+`MODEL_DIR` defaults to `/runpod-volume/ComfyUI-models` when a network volume is
+attached, and to the container disk otherwise — in which case **every cold worker
+re-downloads ~31 GB, billed as runtime**. The startup log says so loudly, and
+`REQUIRE_VOLUME=1` turns it into a refusal to start.
+
+For a local build you can still bake everything in, since no 30-minute limit applies:
+
+```bash
+docker build --build-arg BAKE_MODELS=1 -t <you>/qwen-edit-upscale .
+```
+
 ## Environment variables
 
 | var | default | |
 | --- | --- | --- |
+| `MODEL_DIR` | `/runpod-volume/ComfyUI-models` or `/ComfyUI/models` | where models are cached |
+| `REQUIRE_VOLUME` | `0` | `1` = refuse to start without a network volume |
+| `SKIP_MODEL_DOWNLOAD` | `0` | `1` = assume the models are already in place |
 | `DEFAULT_STEPS` | `4` | used when a request omits `steps` |
 | `DEFAULT_CFG` | `1.0` | used when a request omits `true_cfg_scale` |
 | `DEFAULT_EDIT_MP` | `1.0` | used when a request omits `edit_mp` |
@@ -100,8 +135,13 @@ docker build -t <you>/qwen-edit-upscale:latest .
 docker push <you>/qwen-edit-upscale:latest
 ```
 
-The image is large (~70 GB: fp8 transformer, 7B text encoder, VAE, LoRA, upscalers), so
-`containerDiskInGb` is set to 180 in `.runpod/hub.json`.
+Without the models the image is just the base plus ComfyUI, which builds in minutes and
+fits comfortably inside a RunPod hub build. `containerDiskInGb` is 100 in
+`.runpod/hub.json`: enough for the image, and enough to hold the model set on the
+container disk if no network volume is attached.
+
+The first cold worker on a fresh volume spends a few minutes downloading models before
+ComfyUI starts, so give the endpoint a generous execution timeout for its first request.
 
 ## Batch client
 

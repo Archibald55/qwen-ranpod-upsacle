@@ -1,8 +1,16 @@
-# Qwen-Image-Edit-2511 + Lightning LoRA + Real-ESRGAN upscaling, on ComfyUI.
+# Qwen-Image-Edit-2511 + Lightning LoRA + ESRGAN upscaling, on ComfyUI.
 # Base image, ComfyUI install and model set follow wlsdml1114/qwen_image_edit.
-FROM wlsdml1114/multitalk-base:1.7 as runtime
+#
+# The models are NOT baked in. They total ~31 GB, and a RunPod hub build cannot
+# export and upload a layer that big inside its 30-minute limit (it dies in
+# "exporting layers" / "sending tarball"). entrypoint.sh fetches them on the first
+# cold worker into MODEL_DIR instead - put that on a network volume and the download
+# is paid once per volume. For a local build, bake them in with:
+#
+#   docker build --build-arg BAKE_MODELS=1 -t <you>/qwen-edit-upscale .
+FROM wlsdml1114/multitalk-base:1.7 AS runtime
 
-# wget: model downloads at build time, URL inputs at request time
+# wget: model downloads, both at startup and for URL inputs at request time
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
 
 RUN pip install -U "huggingface_hub[hf_transfer]"
@@ -24,20 +32,17 @@ RUN cd /ComfyUI/custom_nodes/ && \
     cd ComfyUI-KJNodes && \
     pip install --no-cache-dir -r requirements.txt
 
-# ── Qwen-Image-Edit-2511 ────────────────────────────────────────────────────────
-RUN wget -q https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors -O /ComfyUI/models/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors
-RUN wget -q https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors -O /ComfyUI/models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
-RUN wget -q https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors -O /ComfyUI/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
-RUN wget -q https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors -O /ComfyUI/models/vae/qwen_image_vae.safetensors
+RUN mkdir -p /ComfyUI/models/diffusion_models /ComfyUI/models/text_encoders \
+             /ComfyUI/models/vae /ComfyUI/models/loras /ComfyUI/models/upscale_models
 
-# ── Upscalers ───────────────────────────────────────────────────────────────────
-# RealESRGAN_x4plus is the default ("upscale_model" in a request can name either).
-# Both are x4 models and ~64 MB each, so keeping both costs almost nothing.
-RUN mkdir -p /ComfyUI/models/upscale_models && \
-    wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -O /ComfyUI/models/upscale_models/RealESRGAN_x4plus.pth && \
-    wget -q https://huggingface.co/Kim2091/UltraSharp/resolve/main/4x-UltraSharp.pth -O /ComfyUI/models/upscale_models/4x-UltraSharp.pth
+# Optional: bake the model set into the image (local builds only - too slow for a
+# RunPod hub build). Off by default; entrypoint.sh downloads them at startup.
+COPY download_models.sh /download_models.sh
+RUN chmod +x /download_models.sh
+ARG BAKE_MODELS=0
+RUN if [ "$BAKE_MODELS" = "1" ]; then /download_models.sh /ComfyUI/models; fi
 
 COPY . .
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /download_models.sh
 
 CMD ["/entrypoint.sh"]
