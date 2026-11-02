@@ -1,6 +1,6 @@
 # Qwen-Image-Edit-2511 + upscaler — RunPod serverless worker
 
-Edits each photo with Qwen-Image-Edit-2511 (Lightning LoRA, 8 steps by default) at ~1 MP,
+Edits each photo with Qwen-Image-Edit-2511 (Q4_K_M GGUF + Lightning LoRA, 8 steps by default) at ~1 MP,
 then upscales with Real-ESRGAN x4 and resizes to the requested factor
 (`upscale: 2` → ~4 MP). The API matches the FLUX worker, so `qwen_enhance_batch.py` works with it.
 
@@ -8,8 +8,8 @@ then upscales with Real-ESRGAN x4 and resizes to the requested factor
 
 ```bash
 cd qwen-worker
-docker build --platform linux/amd64 -t YOUR_DOCKERHUB_USER/qwen-edit-upscale:v1 .
-docker push YOUR_DOCKERHUB_USER/qwen-edit-upscale:v1
+docker build --platform linux/amd64 -t YOUR_DOCKERHUB_USER/qwen-edit-upscale:v2 .
+docker push YOUR_DOCKERHUB_USER/qwen-edit-upscale:v2
 ```
 
 No Docker locally? Push this folder to a GitHub repo and use **Serverless → New Endpoint →
@@ -19,10 +19,10 @@ GitHub repo**; RunPod builds the Dockerfile for you.
 
 | Setting | Value |
 |---|---|
-| Container image | `YOUR_DOCKERHUB_USER/qwen-edit-upscale:v1` |
-| **Model (cached model)** | `Qwen/Qwen-Image-Edit-2511` ← important, avoids a 58 GB download per worker |
-| GPU | **80 GB** (A100 80GB or H100). The bf16 model needs ~58 GB VRAM |
-| Container disk | 20 GB |
+| Container image | `YOUR_DOCKERHUB_USER/qwen-edit-upscale:v2` |
+| **Model (cached model)** | `Qwen/Qwen-Image-Edit-2511` ← important, avoids a 16 GB text-encoder download per worker |
+| GPU | **24 GB** (RTX 4090, L4 or A5000). 48 GB also works and is less contended |
+| Container disk | 40 GB (the image carries the 12.8 GB quant) |
 | Active workers | 0 |
 | Max workers | 4 (match `--workers` in the batch script) |
 | Idle timeout | 10 s |
@@ -35,7 +35,10 @@ GitHub repo**; RunPod builds the Dockerfile for you.
 |---|---|---|
 | `DEFAULT_STEPS` | 8 | steps when the request doesn't send `steps` (try 4 for cheaper) |
 | `USE_LIGHTNING` | 1 | 0 = plain model (use ~40 steps, cfg 4; much slower) |
-| `CPU_OFFLOAD` | 0 | 1 = run on a 48 GB GPU by offloading to RAM (slow; needs ~64 GB RAM) |
+| `QUANT` | gguf | `gguf` = Q4_K_M transformer (24 GB GPU). `bnb4` = NF4. `off` = bf16, needs 80 GB |
+| `GGUF_FILE` | Q4_K_M | Q5_K_M (15.4 GB) or Q6_K (17.9 GB) on a 32-48 GB GPU. Only Q4_K_M is baked in — others download on cold start |
+| `TEXT_ENCODER_4BIT` | 1 | NF4 Qwen2.5-VL: 16 GB → ~5.5 GB. Required on 24 GB |
+| `CPU_OFFLOAD` | 0 | Last resort if the GPU still OOMs (slow; needs ~64 GB RAM) |
 | `UPSCALE_TILE` | 512 | upscaler tile size; lower if you ever hit OOM there |
 
 ## 3. Request format
@@ -70,14 +73,19 @@ python qwen_enhance_batch.py ./photos ./photos_enhanced --format jpg # smaller f
 ```
 
 Each log line shows output size and GPU seconds (`gpu 10.7s`). Cost per image ≈ GPU seconds ×
-the GPU's per-second rate (A100 80GB flex was ~$0.00076/s; check current pricing).
-For 800 images at ~15 s that is roughly $9 on an A100, plus a cold start per worker.
+the GPU's per-second rate (a 24 GB flex worker was ~$0.00031/s; check current pricing).
+For 800 images at ~12 s that is roughly $3, plus a cold start per worker.
 
 ## Notes
 
-- First request on a fresh worker loads the model (cached: roughly 1–2 min). Then ~10–25 s per image
+- First request on a fresh worker loads the model (cached: roughly 1–2 min). Then ~10–20 s per image
   depending on GPU and steps (measure with a few test images; `timings` is in every response).
+  The startup log line reports allocated and free VRAM — check it after changing `GGUF_FILE`.
 - A 4 MP PNG is ~10–15 MB as base64. If you hit response-size errors, use `output_format: "jpeg"`
   (batch script: `--format jpg`).
 - If colours look off with the Lightning LoRA, compare against `USE_LIGHTNING=0` on a few images;
   there are community reports of colour shifts with diffusers + Lightning.
+- Q4 is a real quality trade-off. For fidelity-critical work (exact colours, fine texture) compare
+  Q4_K_M against Q6_K or `QUANT=off` on a handful of images before committing to a full batch.
+- With a quantized transformer the Lightning LoRA stays an active adapter instead of being fused
+  into the weights (`fuse_lora` cannot write into quantized tensors). Same output, a few % slower.

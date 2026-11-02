@@ -42,7 +42,16 @@ CACHE_ROOT = os.getenv("HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
 USE_LIGHTNING = os.getenv("USE_LIGHTNING", "1") == "1"
 LORA_PATH = os.getenv("LORA_PATH", "/models/lora/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
 UPSCALER_PATH = os.getenv("UPSCALER_PATH", "/models/upscale/RealESRGAN_x4plus.pth")
-CPU_OFFLOAD = os.getenv("CPU_OFFLOAD", "0") == "1"  # for <80 GB GPUs: slower, needs lots of RAM
+CPU_OFFLOAD = os.getenv("CPU_OFFLOAD", "0") == "1"  # last resort: slower, needs lots of RAM
+
+# Quantization. "gguf" (default) runs on a 24 GB GPU: Q4_K_M transformer (12.8 GB) +
+# NF4 text encoder (~5.5 GB) + VAE, ~21 GB peak at edit_mp 1.0. "off" = bf16, needs 80 GB.
+QUANT = os.getenv("QUANT", "gguf").lower()
+GGUF_PATH = os.getenv("GGUF_PATH", "/models/transformer/qwen-image-edit-2511-Q4_K_M.gguf")
+GGUF_REPO = os.getenv("GGUF_REPO", "unsloth/Qwen-Image-Edit-2511-GGUF")
+GGUF_FILE = os.getenv("GGUF_FILE", "qwen-image-edit-2511-Q4_K_M.gguf")
+# NF4-quantize the Qwen2.5-VL text encoder (16 GB bf16 -> ~5.5 GB). Required on 24 GB.
+TEXT_ENCODER_4BIT = os.getenv("TEXT_ENCODER_4BIT", "1" if QUANT != "off" else "0") == "1"
 DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "8" if USE_LIGHTNING else "40"))
 DEFAULT_CFG = float(os.getenv("DEFAULT_CFG", "1.0" if USE_LIGHTNING else "4.0"))
 UPSCALE_TILE = int(os.getenv("UPSCALE_TILE", "512"))
@@ -79,30 +88,106 @@ def resolve_model_path(model_id: str) -> str:
             if os.path.isfile(os.path.join(path, "model_index.json")):
                 log.info(f"using cached model at {path}")
                 return path
-    log.warning(f"{model_id} not found in {CACHE_ROOT}; downloading (~58 GB, slow and billed). "
+    log.warning(f"{model_id} not found in {CACHE_ROOT}; components will download on demand "
+                f"(text encoder ~16 GB, or ~58 GB unquantized). "
                 f"Set the endpoint's Model field to {model_id} to cache it.")
     return model_id
+
+
+def component_source(base_path: str, name: str):
+    """(path_or_repo, subfolder) for one pipeline component, local snapshot or hub repo."""
+    local = os.path.join(base_path, name)
+    if os.path.isdir(local):
+        return local, None
+    return base_path, name
+
+
+def load_transformer_gguf(base_path: str):
+    """Q4/Q5/Q6 GGUF transformer. Dequantized to bf16 per-layer at compute time."""
+    from diffusers import GGUFQuantizationConfig, QwenImageTransformer2DModel
+
+    path = GGUF_PATH
+    if not os.path.isfile(path):
+        from huggingface_hub import hf_hub_download
+        log.warning(f"{GGUF_PATH} not baked in; downloading {GGUF_REPO}/{GGUF_FILE}")
+        path = hf_hub_download(GGUF_REPO, GGUF_FILE)
+    cfg_src, cfg_sub = component_source(base_path, "transformer")
+    kwargs = {"config": cfg_src, "torch_dtype": torch.bfloat16,
+              "quantization_config": GGUFQuantizationConfig(compute_dtype=torch.bfloat16)}
+    if cfg_sub:
+        kwargs["subfolder"] = cfg_sub
+    log.info(f"loading GGUF transformer {os.path.basename(path)}")
+    return QwenImageTransformer2DModel.from_single_file(path, **kwargs)
+
+
+def load_transformer_bnb4(base_path: str):
+    """NF4 bitsandbytes transformer (~11 GB). Alternative to GGUF, no extra file needed."""
+    from diffusers import BitsAndBytesConfig, QwenImageTransformer2DModel
+
+    src, sub = component_source(base_path, "transformer")
+    return QwenImageTransformer2DModel.from_pretrained(
+        src, subfolder=sub, torch_dtype=torch.bfloat16,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True),
+    )
+
+
+def load_text_encoder_4bit(base_path: str):
+    from transformers import BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
+
+    src, sub = component_source(base_path, "text_encoder")
+    log.info("loading NF4 text encoder")
+    return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        src, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": 0},
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True),
+    )
 
 
 def load_pipeline():
     from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
     t0 = time.time()
+    base = resolve_model_path(MODEL_ID)
     kwargs = {"torch_dtype": torch.bfloat16}
     if USE_LIGHTNING:
         kwargs["scheduler"] = FlowMatchEulerDiscreteScheduler.from_config(LIGHTNING_SCHEDULER)
-    pipe = QwenImageEditPlusPipeline.from_pretrained(resolve_model_path(MODEL_ID), **kwargs)
+    if QUANT == "gguf":
+        kwargs["transformer"] = load_transformer_gguf(base)
+    elif QUANT == "bnb4":
+        kwargs["transformer"] = load_transformer_bnb4(base)
+    elif QUANT != "off":
+        raise ValueError(f"QUANT must be gguf, bnb4 or off (got {QUANT!r})")
+    if TEXT_ENCODER_4BIT:
+        kwargs["text_encoder"] = load_text_encoder_4bit(base)
+
+    pipe = QwenImageEditPlusPipeline.from_pretrained(base, **kwargs)
     if not CPU_OFFLOAD:
-        pipe.to(DEVICE)
+        # Quantized components are already placed, and pipe.to() rejects 4-bit modules,
+        # so move the rest one by one instead of pipe.to(DEVICE).
+        for name in ("transformer", "text_encoder", "vae"):
+            mod = getattr(pipe, name, None)
+            if mod is not None and not getattr(mod, "is_quantized", False):
+                mod.to(DEVICE)
     if USE_LIGHTNING:
         pipe.load_lora_weights(os.path.dirname(LORA_PATH), weight_name=os.path.basename(LORA_PATH),
                                adapter_name="lightning")
-        pipe.fuse_lora(adapter_names=["lightning"], lora_scale=1.0)
-        pipe.unload_lora_weights()  # fused weights stay, LoRA layers are removed
+        if QUANT == "off":
+            pipe.fuse_lora(adapter_names=["lightning"], lora_scale=1.0)
+            pipe.unload_lora_weights()  # fused weights stay, LoRA layers are removed
+        else:
+            # fuse_lora cannot write into quantized weights: keep the adapter live instead
+            # (a few % slower per step, same result).
+            pipe.set_adapters(["lightning"], adapter_weights=[1.0])
     if CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
-    log.info(f"pipeline ready in {time.time() - t0:.0f}s (lightning={USE_LIGHTNING}, offload={CPU_OFFLOAD})")
+    free = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
+    log.info(f"pipeline ready in {time.time() - t0:.0f}s (quant={QUANT}, te4bit={TEXT_ENCODER_4BIT}, "
+             f"lightning={USE_LIGHTNING}, offload={CPU_OFFLOAD}); "
+             f"{torch.cuda.memory_allocated() / 1e9:.1f} GB allocated, {free:.1f} GB free")
     return pipe
 
 
@@ -247,7 +332,7 @@ def handler(job):
         }
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
-        return {"error": "CUDA out of memory - lower edit_mp, use an 80 GB GPU, or set CPU_OFFLOAD=1"}
+        return {"error": "CUDA out of memory - lower edit_mp, use a smaller GGUF_FILE, a bigger GPU, or set CPU_OFFLOAD=1"}
     except Exception as e:  # report to the client instead of crashing the worker
         log.exception("job failed")
         return {"error": f"{type(e).__name__}: {e}"}

@@ -1,12 +1,12 @@
 {
   "title": "Qwen-Image-Edit-2511 + Real-ESRGAN Upscale",
-  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 and the Lightning 4-step LoRA, followed by optional Real-ESRGAN x4plus upscaling. Accepts a base64 image plus an edit prompt and an optional style reference image.",
+  "description": "Instruction-driven image editing with Qwen-Image-Edit-2511 (Q4_K_M GGUF) and the Lightning 4-step LoRA, followed by optional Real-ESRGAN x4plus upscaling. Runs on a 24 GB GPU. Accepts a base64 image plus an edit prompt and an optional style reference image.",
   "type": "serverless",
   "category": "image",
   "config": {
     "runsOn": "GPU",
     "gpuCount": 1,
-    "gpuIds": "ADA_80_PRO,AMPERE_80",
+    "gpuIds": "ADA_24,AMPERE_24,ADA_48_PRO,AMPERE_48",
     "containerDiskInGb": 40,
     "env": [
       {
@@ -14,8 +14,45 @@
         "input": {
           "name": "Base model",
           "type": "string",
-          "description": "Hugging Face repo id of the Qwen-Image-Edit base model.",
+          "description": "Hugging Face repo id supplying the text encoder, VAE and configs.",
           "default": "Qwen/Qwen-Image-Edit-2511"
+        }
+      },
+      {
+        "key": "QUANT",
+        "input": {
+          "name": "Quantization",
+          "type": "string",
+          "description": "gguf = Q4_K_M transformer (24 GB GPUs). bnb4 = NF4 instead. off = bf16, needs 80 GB.",
+          "options": [
+            { "label": "GGUF Q4_K_M (24 GB)", "value": "gguf" },
+            { "label": "bitsandbytes NF4", "value": "bnb4" },
+            { "label": "Off - bf16 (80 GB)", "value": "off" }
+          ],
+          "default": "gguf"
+        }
+      },
+      {
+        "key": "GGUF_FILE",
+        "input": {
+          "name": "GGUF quant file",
+          "type": "string",
+          "description": "Only the baked-in file loads without a download. Larger quants need a bigger GPU.",
+          "options": [
+            { "label": "Q4_K_M - 12.8 GB (baked in)", "value": "qwen-image-edit-2511-Q4_K_M.gguf" },
+            { "label": "Q5_K_M - 15.4 GB", "value": "qwen-image-edit-2511-Q5_K_M.gguf" },
+            { "label": "Q6_K - 17.9 GB", "value": "qwen-image-edit-2511-Q6_K.gguf" }
+          ],
+          "default": "qwen-image-edit-2511-Q4_K_M.gguf"
+        }
+      },
+      {
+        "key": "TEXT_ENCODER_4BIT",
+        "input": {
+          "name": "NF4 text encoder",
+          "type": "boolean",
+          "description": "Quantize Qwen2.5-VL from 16 GB to ~5.5 GB. Required on 24 GB GPUs.",
+          "default": true
         }
       },
       {
@@ -41,7 +78,7 @@
         "input": {
           "name": "CPU offload",
           "type": "boolean",
-          "description": "Enable on GPUs smaller than 80 GB. Slower and needs plenty of host RAM.",
+          "description": "Last resort if the GPU still OOMs. Much slower and needs plenty of host RAM.",
           "default": false
         }
       }
