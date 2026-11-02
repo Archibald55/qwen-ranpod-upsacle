@@ -3,7 +3,9 @@
 # there. Run at container start (entrypoint.sh) against a network volume so the
 # ~31 GB is paid once per volume, or at build time with --build-arg BAKE_MODELS=1.
 #
-#   ./download_models.sh /runpod-volume/ComfyUI-models
+#   ./download_models.sh                      # picks the volume automatically
+#   ./download_models.sh /some/other/dir      # or name it explicitly
+#   ./download_models.sh --print-dir          # just report what it would pick
 #
 # Safe to run concurrently: each file is downloaded under an flock and moved into
 # place only once complete, so several cold workers sharing one volume cooperate
@@ -11,7 +13,29 @@
 
 set -uo pipefail
 
-DEST="${1:-${MODEL_DIR:-/ComfyUI/models}}"
+# Where a network volume shows up depends on how it is mounted:
+#   serverless worker -> /runpod-volume
+#   pod               -> /workspace
+# Falling back to the container disk is almost always wrong (it is far too small
+# for ~31 GB, and on serverless it is wiped with the worker), so that case warns.
+resolve_model_dir() {
+    if [ -n "${MODEL_DIR:-}" ]; then
+        echo "$MODEL_DIR"
+    elif [ -d /runpod-volume ]; then
+        echo /runpod-volume/ComfyUI-models
+    elif [ -d /workspace ]; then
+        echo /workspace/ComfyUI-models
+    else
+        echo /ComfyUI/models
+    fi
+}
+
+if [ "${1:-}" = "--print-dir" ]; then
+    resolve_model_dir
+    exit 0
+fi
+
+DEST="${1:-$(resolve_model_dir)}"
 # Models already in the image (the upscalers) are not re-fetched onto the volume.
 BAKED_DIR="${BAKED_DIR:-/ComfyUI/models}"
 LOCK_TIMEOUT="${LOCK_TIMEOUT:-3600}"
@@ -73,6 +97,12 @@ fetch() {
 }
 
 echo "model directory: $DEST"
+if [ "$DEST" = "/ComfyUI/models" ]; then
+    echo "WARNING: no network volume found (neither /runpod-volume nor /workspace exists)," >&2
+    echo "         so ~31 GB of models would go on the container disk - usually too small," >&2
+    echo "         and on serverless thrown away with the worker. Attach a network volume," >&2
+    echo "         or pass an explicit directory / set MODEL_DIR." >&2
+fi
 mkdir -p "$DEST"
 
 # Check there is room before starting. Out of space, wget reports the baffling

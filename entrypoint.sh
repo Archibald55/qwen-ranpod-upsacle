@@ -66,21 +66,22 @@ echo "Using CUDA device: $CUDA_VISIBLE_DEVICES"
 # and upload that much inside its 30-minute limit. Instead it is fetched on the first
 # cold worker into MODEL_DIR, which should live on a network volume so the download is
 # paid once per volume rather than once per worker.
-if [ -z "${MODEL_DIR:-}" ]; then
-    if [ -d /runpod-volume ]; then
-        MODEL_DIR=/runpod-volume/ComfyUI-models
-    else
-        MODEL_DIR=/ComfyUI/models
-        echo "⚠️  No network volume attached (/runpod-volume is missing), so models go to"
-        echo "⚠️  the container disk and EVERY cold worker re-downloads ~31 GB, billed as"
-        echo "⚠️  runtime. Attach a network volume to the endpoint to fetch them once."
-        if [ "${REQUIRE_VOLUME:-0}" = "1" ]; then
-            echo "Error: REQUIRE_VOLUME=1 and no network volume is attached. Exiting..."
-            exit 1
-        fi
+# One resolver for both, so the entrypoint and a manual run can never disagree:
+# /runpod-volume on a serverless worker, /workspace on a pod, container disk otherwise.
+MODEL_DIR="${MODEL_DIR:-$(/download_models.sh --print-dir)}"
+export MODEL_DIR
+echo "Model directory: $MODEL_DIR"
+
+if [ "$MODEL_DIR" = "/ComfyUI/models" ]; then
+    echo "⚠️  No network volume attached (neither /runpod-volume nor /workspace exists),"
+    echo "⚠️  so models go to the container disk: EVERY cold worker re-downloads ~31 GB,"
+    echo "⚠️  billed as runtime, and the disk is probably too small to hold them at all."
+    echo "⚠️  Attach a network volume to the endpoint to fetch them once."
+    if [ "${REQUIRE_VOLUME:-0}" = "1" ]; then
+        echo "Error: REQUIRE_VOLUME=1 and no network volume is attached. Exiting..."
+        exit 1
     fi
 fi
-export MODEL_DIR
 
 if [ "${SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
     echo "Preparing models in $MODEL_DIR ..."

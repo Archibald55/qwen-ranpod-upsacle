@@ -98,10 +98,28 @@ None of this is baked into the image. A RunPod **hub build cannot export and upl
 workers sharing one volume cooperate instead of fighting. ComfyUI is then pointed at
 `MODEL_DIR` through a generated `extra_model_paths.yaml`.
 
-`MODEL_DIR` defaults to `/runpod-volume/ComfyUI-models` when a network volume is
-attached, and to the container disk otherwise — in which case **every cold worker
-re-downloads ~31 GB, billed as runtime**. The startup log says so loudly, and
-`REQUIRE_VOLUME=1` turns it into a refusal to start.
+`MODEL_DIR` is detected from where the volume actually is, because that differs by
+how you run the container:
+
+| | volume mounts at | `MODEL_DIR` becomes |
+| --- | --- | --- |
+| serverless worker | `/runpod-volume` | `/runpod-volume/ComfyUI-models` |
+| pod | `/workspace` | `/workspace/ComfyUI-models` |
+| neither | – | `/ComfyUI/models` (container disk) |
+
+The last row is the bad one: **every cold worker re-downloads ~31 GB, billed as
+runtime**, and the container disk is usually too small to hold them anyway. Startup
+warns loudly, the free-space check refuses rather than failing mid-download, and
+`REQUIRE_VOLUME=1` turns it into a refusal to start at all. Set `MODEL_DIR` explicitly
+to override the detection.
+
+To pre-warm a volume from a cheap CPU pod, mount it and run the same script — it picks
+`/workspace/ComfyUI-models` on its own, which the serverless workers then see at
+`/runpod-volume/ComfyUI-models`:
+
+```bash
+./download_models.sh                # or: ./download_models.sh --print-dir  to check first
+```
 
 For a local build you can still bake everything in, since no 30-minute limit applies:
 
@@ -113,7 +131,7 @@ docker build --build-arg BAKE_MODELS=1 -t <you>/qwen-edit-upscale .
 
 | var | default | |
 | --- | --- | --- |
-| `MODEL_DIR` | `/runpod-volume/ComfyUI-models` or `/ComfyUI/models` | where models are cached |
+| `MODEL_DIR` | detected (see [Models](#models)) | where models are cached |
 | `REQUIRE_VOLUME` | `0` | `1` = refuse to start without a network volume |
 | `SKIP_MODEL_DOWNLOAD` | `0` | `1` = assume the models are already in place |
 | `DEFAULT_STEPS` | `4` | used when a request omits `steps` |
