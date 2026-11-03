@@ -56,12 +56,31 @@ already exists inside the container).
   "height": 2048,
   "seed": 42,
   "upscale": 2.0,
-  "timings": {"total_s": 14.2, "comfy_s": 12.9, "gpu_s": 12.9, "steps": 4}
+  "timings": {
+    "total_s": 14.2, "comfy_s": 12.9, "gpu_s": 12.9, "steps": 4,
+    "nodes": {"3 KSampler": 8.4, "111 TextEncodeQwenImageEditPlus": 1.9,
+              "901 ImageUpscaleWithModel": 1.7},
+    "job_on_worker": 1, "worker_uptime_s": 61.3,
+    "cold_start": {"total_s": 137, "download_s": 0, "copy_s": 72, "comfyui_s": 41,
+                   "model_dir": "/ComfyUI/models", "local_copy": true}
+  }
 }
 ```
 
 Errors come back as `{"error": "..."}` with the failing ComfyUI node named, rather than
 killing the worker.
+
+`timings` is the diagnostic surface:
+
+- **`nodes`** — seconds per ComfyUI node, slowest first. Large `KSampler` is compute;
+  large `UNETLoader` / `CLIPLoader` is the model load (expected only on job 1, and a
+  sign of slow storage otherwise); large `ImageUpscaleWithModel` is the upscale pass.
+- **`job_on_worker`** — `1` means this job paid the cold start, so compare like with
+  like before concluding anything is slow.
+- **`cold_start`** — present on job 1 only, written by `entrypoint.sh` because all of it
+  happens before the handler exists: model download, the copy to local disk, and
+  ComfyUI's own boot. `local_copy: false` means weights are being streamed from the
+  network volume and everything will be slow.
 
 ## How the upscale pass works
 

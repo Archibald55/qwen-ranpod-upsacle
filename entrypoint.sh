@@ -85,7 +85,9 @@ fi
 
 if [ "${SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
     echo "Preparing models in $MODEL_DIR ..."
+    phase_start=$SECONDS
     /download_models.sh "$MODEL_DIR" || exit 1
+    BOOT_DOWNLOAD_S=$((SECONDS - phase_start))
 fi
 
 # ── Copy models to local disk ───────────────────────────────────────────────────
@@ -104,7 +106,8 @@ if [ "$MODEL_DIR" != "/ComfyUI/models" ] && [ "${LOCAL_MODEL_COPY:-1}" = "1" ]; 
         echo "(local reads keep ComfyUI's weight streaming off the network volume)..."
         copy_start=$SECONDS
         if cp -rn "$MODEL_DIR"/. /ComfyUI/models/ 2>/dev/null; then
-            echo "Copied in $((SECONDS - copy_start))s; using /ComfyUI/models"
+            BOOT_COPY_S=$((SECONDS - copy_start))
+            echo "Copied in ${BOOT_COPY_S}s; using /ComfyUI/models"
             MODEL_DIR=/ComfyUI/models
             export MODEL_DIR
         else
@@ -146,6 +149,7 @@ fi
 
 # Start ComfyUI in the background
 echo "Starting ComfyUI in the background..."
+comfy_start=$SECONDS
 python /ComfyUI/main.py --listen --use-sage-attention ${COMFY_ARGS:-} &
 
 # Wait for ComfyUI to be ready
@@ -166,6 +170,25 @@ if [ $wait_count -ge $max_wait ]; then
     echo "Error: ComfyUI failed to start within $max_wait seconds"
     exit 1
 fi
+BOOT_COMFY_S=$((SECONDS - comfy_start))
+
+# ── Cold-start report ───────────────────────────────────────────────────────────
+# All of this happens before handler.py exists, so it cannot be timed from inside
+# the handler. Leave it where the handler can pick it up and attach it to the
+# first job's response, which is what makes cold-start cost visible to the client.
+echo "cold start: ${SECONDS}s total" \
+     "(models ${BOOT_DOWNLOAD_S:-0}s, copy ${BOOT_COPY_S:-0}s, comfyui ${BOOT_COMFY_S:-0}s)"
+cat > "${BOOT_REPORT:-/tmp/worker_boot.json}" <<JSON
+{
+  "total_s": ${SECONDS},
+  "download_s": ${BOOT_DOWNLOAD_S:-0},
+  "copy_s": ${BOOT_COPY_S:-0},
+  "comfyui_s": ${BOOT_COMFY_S:-0},
+  "model_dir": "$MODEL_DIR",
+  "local_copy": $([ "$MODEL_DIR" = "/ComfyUI/models" ] && echo true || echo false),
+  "comfy_args": "${COMFY_ARGS:-}"
+}
+JSON
 
 # Start the handler in the foreground
 # 이 스크립트가 컨테이너의 메인 프로세스가 됩니다.

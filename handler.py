@@ -115,6 +115,17 @@ COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/ComfyUI/input")
 # For telling a cold worker's first job apart from a warm worker's tenth.
 WORKER_START = time.time()
 JOBS_SERVED = 0
+# Written by entrypoint.sh: everything that happened before this process started
+# (model download, copy to local disk, ComfyUI boot), which the handler cannot time.
+BOOT_REPORT = os.getenv("BOOT_REPORT", "/tmp/worker_boot.json")
+
+
+def boot_report():
+    try:
+        with open(BOOT_REPORT, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 # ───────────────────────── input handling ─────────────────────────
@@ -475,7 +486,11 @@ def handler(job):
                         # means model loading, a big KSampler means compute
                         "nodes": nodes,
                         "job_on_worker": JOBS_SERVED,
-                        "worker_uptime_s": round(time.time() - WORKER_START, 1)},
+                        "worker_uptime_s": round(time.time() - WORKER_START, 1),
+                        # Cold-start cost, on the job that actually paid for it. The
+                        # first job also absorbs the model load into VRAM, which shows
+                        # up under "nodes" as time inside UNETLoader/CLIPLoader.
+                        **({"cold_start": boot_report()} if JOBS_SERVED == 1 else {})},
         }
     except Exception as e:
         logger.exception("job failed")
@@ -521,4 +536,10 @@ def log_gpu_info():
 
 if __name__ == "__main__":
     log_gpu_info()
+    boot = boot_report()
+    if boot:
+        logger.info(f"cold start before this process: {boot['total_s']}s "
+                    f"(models {boot['download_s']}s, copy {boot['copy_s']}s, "
+                    f"comfyui {boot['comfyui_s']}s), models at {boot['model_dir']}"
+                    f"{' (local copy)' if boot.get('local_copy') else ' (NOT local - slow)'}")
     runpod.serverless.start({"handler": handler})
