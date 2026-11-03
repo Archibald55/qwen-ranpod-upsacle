@@ -17,7 +17,7 @@ Request:
       # Picture 1 - the image being edited. One of:
       "image_base64": "<base64 or data URI>",
       "image_url":   "https://...",
-      "image_path":  "/abs/path.png",         # path inside the container
+      "image_path":  "/abs/path.png",         # a path inside the container (staged in)
 
       # Picture 2 / 3 - optional extra references, same three forms:
       "image_base64_2" | "image_url_2" | "image_path_2",
@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -106,6 +107,10 @@ UPSCALE_RESAMPLE = os.getenv("UPSCALE_RESAMPLE", "lanczos")
 MAX_UPSCALE = float(os.getenv("MAX_UPSCALE", "4"))
 JOB_TIMEOUT = float(os.getenv("JOB_TIMEOUT", "900"))        # per-request ComfyUI budget
 BOOT_TIMEOUT = float(os.getenv("BOOT_TIMEOUT", "300"))      # wait for ComfyUI on cold start
+# LoadImage resolves names against ComfyUI's input directory, and current ComfyUI
+# rejects absolute paths that point outside it ("Invalid image file: /tmp/..."), so
+# every input is staged here and referenced by bare filename.
+COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/ComfyUI/input")
 
 
 # ───────────────────────── input handling ─────────────────────────
@@ -132,11 +137,31 @@ def save_base64(data: str, output_path: str) -> str:
     return output_path
 
 
-def resolve_image(job_input: dict, slot: int, temp_dir: str):
-    """Materialize the image for Picture `slot` as a file, or return None if absent.
+# Staged files are named by the format actually decoded, not by whatever the caller
+# implied, so ComfyUI (which lists input files by extension) sees a consistent name.
+EXT_BY_FORMAT = {"JPEG": ".jpg", "MPO": ".jpg", "PNG": ".png", "WEBP": ".webp",
+                 "TIFF": ".tif", "BMP": ".bmp", "GIF": ".gif"}
 
-    Accepts image_path / image_url / image_base64 (slot 1) and the _2 / _3 variants,
-    plus reference_image_* as an alias for slot 2.
+
+def verify_image(path: str, source: str):
+    """Fail here, with a useful message, rather than inside ComfyUI's validator."""
+    try:
+        with Image.open(path) as im:
+            im.verify()
+            return im.format
+    except Exception as e:
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        raise RuntimeError(f"{source} is not a readable image ({size} bytes: "
+                           f"{type(e).__name__}: {e}). A truncated or non-image "
+                           f"base64 payload is the usual cause.")
+
+
+def resolve_image(job_input: dict, slot: int, task_id: str):
+    """Stage the image for Picture `slot` in ComfyUI's input directory.
+
+    Returns the bare filename to put in the LoadImage node, or None when this slot
+    has no input. Accepts image_path / image_url / image_base64 (slot 1) and the
+    _2 / _3 variants, plus reference_image_* as an alias for slot 2.
     """
     suffix = "" if slot == 1 else f"_{slot}"
     keys = [(f"image_path{suffix}", "path"), (f"image_url{suffix}", "url"),
@@ -148,13 +173,31 @@ def resolve_image(job_input: dict, slot: int, temp_dir: str):
         value = job_input.get(key)
         if not value:
             continue
+        os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+        # Named for the job so concurrent requests on one worker cannot collide.
+        filename = f"{task_id}_{slot}.png"
+        dst = os.path.join(COMFY_INPUT_DIR, filename)
         if kind == "path":
             if not os.path.isfile(value):
                 raise RuntimeError(f"{key} does not exist in the container: {value}")
-            return value
-        os.makedirs(temp_dir, exist_ok=True)
-        dst = os.path.abspath(os.path.join(temp_dir, f"input_{slot}.png"))
-        return download_file(value, dst) if kind == "url" else save_base64(value, dst)
+            # Hardlink where possible; ComfyUI must see it under its input directory.
+            try:
+                os.link(value, dst)
+            except OSError:
+                shutil.copyfile(value, dst)
+        elif kind == "url":
+            download_file(value, dst)
+        else:
+            save_base64(value, dst)
+        fmt = verify_image(dst, key)
+        ext = EXT_BY_FORMAT.get(fmt or "", ".png")
+        if not filename.endswith(ext):
+            os.replace(dst, os.path.join(COMFY_INPUT_DIR, filename[:-4] + ext))
+            filename = filename[:-4] + ext
+        logger.info(f"picture {slot}: {filename} ({fmt}, "
+                    f"{os.path.getsize(os.path.join(COMFY_INPUT_DIR, filename)) / 1e6:.1f} MB)"
+                    f" from {key}")
+        return filename
     return None
 
 
@@ -289,11 +332,11 @@ def add_upscale(prompt: dict, factor: float, model_name: str):
                 f"(model x{UPSCALE_MODEL_SCALE:g}, then x{scale_by:.3f} {UPSCALE_RESAMPLE})")
 
 
-def build_prompt(job_input: dict, image_paths: list, seed: int) -> dict:
-    prompt = load_workflow(len(image_paths))
+def build_prompt(job_input: dict, image_names: list, seed: int) -> dict:
+    prompt = load_workflow(len(image_names))
 
-    for slot, path in enumerate(image_paths, start=1):
-        prompt[NODE_IMAGE[slot]]["inputs"]["image"] = path
+    for slot, name in enumerate(image_names, start=1):
+        prompt[NODE_IMAGE[slot]]["inputs"]["image"] = name
 
     prompt[NODE_POSITIVE]["inputs"]["prompt"] = job_input["prompt"]
     prompt[NODE_NEGATIVE]["inputs"]["prompt"] = job_input.get("negative_prompt") or ""
@@ -347,7 +390,7 @@ def encode_output(raw: bytes, fmt: str, quality: int):
 def handler(job):
     job_input = job.get("input") or {}
     t0 = time.time()
-    image_paths = []
+    staged = []
     try:
         prompt_text = (job_input.get("prompt") or "").strip()
         if not prompt_text:
@@ -365,18 +408,18 @@ def handler(job):
         seed = job_input.get("seed")
         seed = random.randint(0, 2**31 - 1) if seed is None or int(seed) < 0 else int(seed)
 
-        temp_dir = os.path.join("/tmp", f"task_{uuid.uuid4().hex}")
+        task_id = f"task_{uuid.uuid4().hex}"
         for slot in (1, 2, 3):
-            path = resolve_image(job_input, slot, temp_dir)
-            if path is None:
+            name = resolve_image(job_input, slot, task_id)
+            if name is None:
                 break           # Picture 3 without Picture 2 is not a thing
-            image_paths.append(path)
-        if not image_paths:
+            staged.append(name)
+        if not staged:
             return {"error": "an image is required (image_base64, image_url or image_path)"}
 
-        logger.info(f"job: {len(image_paths)} image(s), seed {seed}, upscale x{factor:g}, "
+        logger.info(f"job: {len(staged)} image(s), seed {seed}, upscale x{factor:g}, "
                     f"steps {job_input.get('steps') or DEFAULT_STEPS}, format {fmt}")
-        graph = build_prompt(job_input, image_paths, seed)
+        graph = build_prompt(job_input, staged, seed)
 
         wait_for_comfyui(BOOT_TIMEOUT)
         t1 = time.time()
@@ -402,14 +445,12 @@ def handler(job):
         logger.exception("job failed")
         return {"error": f"{type(e).__name__}: {e}"}
     finally:
-        # only the files this request materialized; an image_path input is the caller's
-        for path in image_paths:
-            if path.startswith("/tmp/task_"):
-                try:
-                    os.remove(path)
-                    os.rmdir(os.path.dirname(path))
-                except OSError:
-                    pass
+        # Staged copies only; an image_path input's original is the caller's file.
+        for name in staged:
+            try:
+                os.remove(os.path.join(COMFY_INPUT_DIR, name))
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
