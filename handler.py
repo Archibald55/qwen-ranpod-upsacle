@@ -453,5 +453,36 @@ def handler(job):
                 pass
 
 
+def log_gpu_info():
+    """Report whether this torch build actually has kernels for this GPU.
+
+    A Blackwell card (RTX 5090, sm_120) on a pre-CUDA-12.8 torch still runs, by
+    JIT-compiling from an older PTX target, but several times slower than native -
+    and nothing in the logs says so. This makes that visible instead.
+    """
+    try:
+        import torch
+    except Exception as e:
+        logger.warning(f"torch not importable for the GPU check: {e}")
+        return
+    if not torch.cuda.is_available():
+        logger.error("no CUDA device visible")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    cc = f"sm_{major}{minor}"
+    archs = list(torch.cuda.get_arch_list() or [])
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    logger.info(f"gpu {name} ({cc}, {vram:.0f} GB), torch {torch.__version__} "
+                f"cuda {torch.version.cuda}, kernels for {archs or 'unknown'}")
+    if archs and cc not in archs:
+        ptx = [a for a in archs if a.startswith("compute_")]
+        logger.warning(
+            f"PERFORMANCE: this torch build has no {cc} kernels, so {name} runs via "
+            f"{'JIT from ' + ptx[-1] if ptx else 'no compatible target'} - expect it to "
+            f"be several times slower than it should be. Rebuild on a CUDA 12.8+ torch.")
+
+
 if __name__ == "__main__":
+    log_gpu_info()
     runpod.serverless.start({"handler": handler})
