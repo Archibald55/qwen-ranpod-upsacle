@@ -89,7 +89,7 @@ paid on every job, and easily mistaken for slow generation. 48 GB keeps both loa
 | GPU | RunPod id | |
 | --- | --- | --- |
 | L40S / RTX 6000 Ada, 48 GB | `ADA_48_PRO` | **preferred**: everything resident, no arch risk |
-| A6000 / A40, 48 GB | `AMPERE_48` | same headroom, slower per step |
+| A6000 / A40, 48 GB | `AMPERE_48` | same headroom, no arch risk; Ampere has no fp8 tensor cores, so the fp8 weights are upcast to bf16 - roughly 1.5-2.5x slower per step, often cheaper per second |
 | RTX 5090, 32 GB | `ADA_32_PRO` | enough VRAM, but needs a torch with `sm_120` kernels - check the startup log |
 | 4090 / L4, 24 GB | `ADA_24` | cheapest; reloads a model every request |
 
