@@ -112,6 +112,10 @@ BOOT_TIMEOUT = float(os.getenv("BOOT_TIMEOUT", "300"))      # wait for ComfyUI o
 # every input is staged here and referenced by bare filename.
 COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/ComfyUI/input")
 
+# For telling a cold worker's first job apart from a warm worker's tenth.
+WORKER_START = time.time()
+JOBS_SERVED = 0
+
 
 # ───────────────────────── input handling ─────────────────────────
 
@@ -242,10 +246,17 @@ def get_image(filename: str, subfolder: str, folder_type: str) -> bytes:
 
 
 def run_workflow(prompt: dict, timeout: float):
-    """Queue the graph, wait for it to finish, return the output images as bytes."""
+    """Queue the graph, wait for it to finish, return (images, per-node seconds).
+
+    ComfyUI announces each node as it starts executing, which is the only way to see
+    where the time actually goes: a slow model load shows up as seconds inside
+    UNETLoader/CLIPLoader, slow compute as seconds inside KSampler.
+    """
     ws = websocket.WebSocket()
     ws.settimeout(timeout)
     ws.connect(f"ws://{SERVER_ADDRESS}:{SERVER_PORT}/ws?clientId={CLIENT_ID}")
+    node_times = {}
+    running, started = None, None
     try:
         prompt_id = queue_prompt(prompt)
         logger.info(f"queued prompt {prompt_id}")
@@ -266,9 +277,13 @@ def run_workflow(prompt: dict, timeout: float):
                                    f"{data.get('exception_message')}")
             if message.get("type") == "execution_interrupted":
                 raise RuntimeError("ComfyUI execution was interrupted")
-            if message.get("type") == "executing" and data.get("node") is None \
-                    and data.get("prompt_id") == prompt_id:
-                break
+            if message.get("type") == "executing":
+                node = data.get("node")
+                if running is not None and started is not None:
+                    node_times[running] = node_times.get(running, 0.0) + time.time() - started
+                if node is None and data.get("prompt_id") == prompt_id:
+                    break
+                running, started = node, time.time()
     finally:
         try:
             ws.close()
@@ -286,7 +301,14 @@ def run_workflow(prompt: dict, timeout: float):
                                     image.get("type", "output")))
     if not images:
         raise RuntimeError(f"the workflow produced no images (status: {status})")
-    return images
+    return images, node_times
+
+
+def node_breakdown(prompt: dict, node_times: dict, top: int = 6) -> dict:
+    """{"37 UNETLoader": 182.4, ...} for the slowest nodes, for the log and response."""
+    ranked = sorted(node_times.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    return {f"{node} {prompt.get(node, {}).get('class_type', '?')}": round(secs, 2)
+            for node, secs in ranked if secs >= 0.05}
 
 
 # ───────────────────────── graph preparation ─────────────────────────
@@ -421,14 +443,22 @@ def handler(job):
                     f"steps {job_input.get('steps') or DEFAULT_STEPS}, format {fmt}")
         graph = build_prompt(job_input, staged, seed)
 
+        tb = time.time()
         wait_for_comfyui(BOOT_TIMEOUT)
+        boot_s = time.time() - tb
         t1 = time.time()
-        images = run_workflow(graph, JOB_TIMEOUT)
+        images, node_times = run_workflow(graph, JOB_TIMEOUT)
         comfy_s = time.time() - t1
+        nodes = node_breakdown(graph, node_times)
 
         data_uri, width, height = encode_output(images[0], fmt, quality)
         extra = [encode_output(raw, fmt, quality)[0] for raw in images[1:]]
-        logger.info(f"done: {width}x{height} in {comfy_s:.1f}s on the GPU")
+        global JOBS_SERVED
+        JOBS_SERVED += 1
+        logger.info(f"done: {width}x{height} in {comfy_s:.1f}s on the GPU "
+                    f"(job {JOBS_SERVED} on this worker, up {time.time() - WORKER_START:.0f}s)")
+        logger.info("time per node: " + (", ".join(f"{k} {v}s" for k, v in nodes.items())
+                                         or "nothing reported"))
         return {
             "image": data_uri,
             "images": [data_uri] + extra,
@@ -439,7 +469,13 @@ def handler(job):
             "timings": {"total_s": round(time.time() - t0, 2),
                         "comfy_s": round(comfy_s, 2),
                         "gpu_s": round(comfy_s, 2),
-                        "steps": graph[NODE_SAMPLER]["inputs"]["steps"]},
+                        "boot_wait_s": round(boot_s, 2),
+                        "steps": graph[NODE_SAMPLER]["inputs"]["steps"],
+                        # which nodes the time went into: a big UNETLoader/CLIPLoader
+                        # means model loading, a big KSampler means compute
+                        "nodes": nodes,
+                        "job_on_worker": JOBS_SERVED,
+                        "worker_uptime_s": round(time.time() - WORKER_START, 1)},
         }
     except Exception as e:
         logger.exception("job failed")
