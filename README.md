@@ -116,6 +116,26 @@ None of this is baked into the image. A RunPod **hub build cannot export and upl
 workers sharing one volume cooperate instead of fighting. ComfyUI is then pointed at
 `MODEL_DIR` through a generated `extra_model_paths.yaml`.
 
+### Why the models are then copied to local disk
+
+Current ComfyUI streams weights on demand instead of loading them whole, and it checks
+where they live:
+
+```
+Model storage policy: fast_disk=False paths=['/runpod-volume/ComfyUI-models/...']
+Model QwenImage prepared for dynamic VRAM loading. 19582MB Staged.
+```
+
+`fast_disk=False` on a network volume means ~20 GB is paged over NFS *during sampling,
+on every request* — which looks exactly like a slow GPU and is not. So after fetching,
+`entrypoint.sh` copies the set to the container disk (one sequential read per cold
+worker) and points ComfyUI there. It needs the model size plus 5 GB free, warns loudly
+when there isn't room, and `LOCAL_MODEL_COPY=0` disables it.
+
+On a card with 40 GB or more, ComfyUI is also started with `--highvram` so the weights
+stay resident in VRAM rather than being staged per request. `COMFY_ARGS` overrides the
+launch flags entirely.
+
 `MODEL_DIR` is detected from where the volume actually is, because that differs by
 how you run the container:
 
@@ -155,6 +175,8 @@ docker build --build-arg BAKE_MODELS=1 -t <you>/qwen-edit-upscale .
 | `REQUIRE_VOLUME` | `0` | `1` = refuse to start without a network volume |
 | `MIN_VOLUME_GB` | `40` | free space a mount needs before it is chosen automatically |
 | `SKIP_MODEL_DOWNLOAD` | `0` | `1` = assume the models are already in place |
+| `LOCAL_MODEL_COPY` | `1` | copy models from the volume to the container disk; `0` = stream from the volume |
+| `COMFY_ARGS` | `--highvram` on 40 GB+ | extra ComfyUI launch flags |
 | `DEFAULT_STEPS` | `4` | used when a request omits `steps` |
 | `DEFAULT_CFG` | `1.0` | used when a request omits `true_cfg_scale` |
 | `DEFAULT_EDIT_MP` | `1.0` | used when a request omits `edit_mp` |
