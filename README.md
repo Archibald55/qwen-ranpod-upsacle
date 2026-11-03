@@ -80,6 +80,24 @@ resize. With `upscale: 1` the graph is left untouched.
 Because the upscale runs as ComfyUI nodes, it is tiled and VRAM-bounded by ComfyUI
 itself; a 4x pass on a 1 MP edit fits on a 24 GB card.
 
+## Which GPU
+
+The fp8 transformer is ~20 GB and the fp8 text encoder ~9 GB. On a 24 GB card they
+cannot both stay resident, so ComfyUI evicts one and reloads it on the next request -
+paid on every job, and easily mistaken for slow generation. 48 GB keeps both loaded.
+
+| GPU | RunPod id | |
+| --- | --- | --- |
+| L40S / RTX 6000 Ada, 48 GB | `ADA_48_PRO` | **preferred**: everything resident, no arch risk |
+| A6000 / A40, 48 GB | `AMPERE_48` | same headroom, slower per step |
+| RTX 5090, 32 GB | `ADA_32_PRO` | enough VRAM, but needs a torch with `sm_120` kernels - check the startup log |
+| 4090 / L4, 24 GB | `ADA_24` | cheapest; reloads a model every request |
+
+Startup logs the card, its compute capability and the arch list torch was built for,
+and warns when the two do not match - a Blackwell card on a pre-CUDA-12.8 torch runs
+via PTX JIT at a fraction of its real speed.
+
+
 ## Models
 
 | file | size | where |
