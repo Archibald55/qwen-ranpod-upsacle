@@ -101,11 +101,13 @@ workers sharing one volume cooperate instead of fighting. ComfyUI is then pointe
 `MODEL_DIR` is detected from where the volume actually is, because that differs by
 how you run the container:
 
-| | volume mounts at | `MODEL_DIR` becomes |
-| --- | --- | --- |
-| serverless worker | `/runpod-volume` | `/runpod-volume/ComfyUI-models` |
-| pod | `/workspace` | `/workspace/ComfyUI-models` |
-| neither | – | `/ComfyUI/models` (container disk) |
+1. `MODEL_DIR`, if set — always wins.
+2. Any candidate that **already holds the models** (checked by looking for the
+   transformer), so a full-but-populated volume is never passed over.
+3. `/runpod-volume` (serverless), then `/workspace` (pod), then **any other real mount**
+   read out of `/proc/mounts` — that last step is what finds a global or otherwise
+   custom-mounted volume. A candidate needs `MIN_VOLUME_GB` (40) free to be chosen.
+4. `/ComfyUI/models` — the container disk, with a warning.
 
 The last row is the bad one: **every cold worker re-downloads ~31 GB, billed as
 runtime**, and the container disk is usually too small to hold them anyway. Startup
@@ -133,6 +135,7 @@ docker build --build-arg BAKE_MODELS=1 -t <you>/qwen-edit-upscale .
 | --- | --- | --- |
 | `MODEL_DIR` | detected (see [Models](#models)) | where models are cached |
 | `REQUIRE_VOLUME` | `0` | `1` = refuse to start without a network volume |
+| `MIN_VOLUME_GB` | `40` | free space a mount needs before it is chosen automatically |
 | `SKIP_MODEL_DOWNLOAD` | `0` | `1` = assume the models are already in place |
 | `DEFAULT_STEPS` | `4` | used when a request omits `steps` |
 | `DEFAULT_CFG` | `1.0` | used when a request omits `true_cfg_scale` |

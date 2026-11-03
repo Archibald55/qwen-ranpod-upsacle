@@ -13,21 +13,59 @@
 
 set -uo pipefail
 
-# Where a network volume shows up depends on how it is mounted:
-#   serverless worker -> /runpod-volume
-#   pod               -> /workspace
-# Falling back to the container disk is almost always wrong (it is far too small
-# for ~31 GB, and on serverless it is wiped with the worker), so that case warns.
+# Where a volume shows up depends on how it is mounted: /runpod-volume on a
+# serverless worker, /workspace on a pod, and anywhere at all for a global or
+# otherwise custom-mounted volume. So the well-known paths are only tried first;
+# after them, any real mount with room is considered. MODEL_DIR overrides all of it.
+MIN_VOLUME_GB="${MIN_VOLUME_GB:-40}"
+# Presence of this file means "the model set already lives here", which beats any
+# free-space heuristic - a full-but-populated volume is exactly what we want.
+SENTINEL="diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors"
+
+free_gb() {
+    df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4 / 1048576)}'
+}
+
+# Mount points that could plausibly hold models: real filesystems, writable, not
+# the container's own root or system mounts.
+detect_mounts() {
+    [ -r /proc/mounts ] || return 0
+    awk '$2 != "/" &&
+         $3 !~ /^(overlay|tmpfs|devtmpfs|proc|sysfs|cgroup|cgroup2|devpts|mqueue|securityfs|pstore|bpf|debugfs|tracefs|configfs|fusectl|binfmt_misc|autofs|squashfs|ramfs|nsfs|rpc_pipefs|fuse.snapfuse)$/ &&
+         $2 !~ /^\/(proc|sys|dev|run|etc|usr|bin|sbin|lib|var|tmp|boot)(\/|$)/ {print $2}' /proc/mounts |
+        sort -u
+}
+
 resolve_model_dir() {
     if [ -n "${MODEL_DIR:-}" ]; then
         echo "$MODEL_DIR"
-    elif [ -d /runpod-volume ]; then
-        echo /runpod-volume/ComfyUI-models
-    elif [ -d /workspace ]; then
-        echo /workspace/ComfyUI-models
-    else
-        echo /ComfyUI/models
+        return
     fi
+
+    local candidates mount
+    candidates="/runpod-volume /workspace"
+    for mount in $(detect_mounts); do
+        case " $candidates " in *" $mount "*) ;; *) candidates="$candidates $mount" ;; esac
+    done
+
+    # A directory that already holds the models wins outright.
+    for mount in $candidates; do
+        if [ -s "$mount/ComfyUI-models/$SENTINEL" ]; then
+            echo "$mount/ComfyUI-models"
+            return
+        fi
+    done
+    # Otherwise the first one with room for them.
+    for mount in $candidates; do
+        [ -d "$mount" ] && [ -w "$mount" ] || continue
+        local free
+        free=$(free_gb "$mount")
+        if [ -n "$free" ] && [ "$free" -ge "$MIN_VOLUME_GB" ]; then
+            echo "$mount/ComfyUI-models"
+            return
+        fi
+    done
+    echo /ComfyUI/models
 }
 
 if [ "${1:-}" = "--print-dir" ]; then
